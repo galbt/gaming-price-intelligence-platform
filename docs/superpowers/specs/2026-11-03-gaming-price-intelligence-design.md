@@ -23,7 +23,8 @@ good deal, and should I buy now or wait?"
 - Build a working, end-to-end local pipeline: Kafka → Spark (streaming +
   batch) → Iceberg (Bronze/Silver/Gold) → ClickHouse, orchestrated by
   Airflow, entirely in docker-compose.
-- Track real price/discount data for a curated watchlist of 100 games,
+- Track real price/discount data for a curated watchlist of 350 games
+  (split across mutual and platform-exclusive tiers — see Scope),
   comparing PC (Steam) vs PS5 (PlatPrices) pricing.
 - Produce a Deal Quality Score (0-100) per **(game, platform, region)**,
   based on that combination's own historical price behavior (historical
@@ -35,9 +36,14 @@ good deal, and should I buy now or wait?"
   formula weights are left to the builder.)
 - Support the MVP consumer questions:
   - Is this a good deal right now? (Deal Quality Score)
-  - Where's it cheaper — Steam or PS5?
+  - Where's it cheaper — Steam or PS5? (for mutual titles)
   - What's this game's price history?
   - What are the best deals right now, across the watchlist?
+- Support broader, platform-level questions enabled by also tracking
+  platform-exclusive titles (see Scope): does one platform discount more
+  aggressively than the other overall? Do exclusives get better or worse
+  deals than multiplatform titles? Are there genre-level discount
+  patterns that differ by platform?
 - Exercise the harder, more realistic capabilities of each tool rather
   than the trivial path: Spark Structured Streaming with Kafka, Iceberg
   `MERGE INTO` for real change-detection (not just appends), Airflow DAG
@@ -50,8 +56,10 @@ good deal, and should I buy now or wait?"
   scoped PlayStation to PS5 only.
 - No multi-edition, DLC, or bundle tracking. One edition per game per
   platform (standard edition), chosen for comparability, not completeness.
-- No automated cross-catalog entity resolution (fuzzy matching game titles
-  across Steam/PlatPrices/RAWG). Identity mapping is hand-curated.
+- No fuzzy-matching automation left unchecked: catalog discovery is
+  API-driven (see Scope), but ambiguous matches (sequels, editions,
+  remasters) always get a human review pass before entering `dim_game` —
+  nothing is auto-accepted on a low-confidence match.
 - No cloud deployment of any kind (no AWS, no managed services, no company
   infrastructure). Docker-compose on a laptop only.
 - No BI tool in the MVP. Presentation is direct SQL against ClickHouse;
@@ -107,29 +115,56 @@ Note: ITAD backfill covers the **PC side only**. There is no free historical-pri
 
 ## Scope
 
-- **Watchlist: 100 games**, hand-curated, tracked on PC (Steam, standard
-  edition) and PS5 (PlatPrices, standard edition) only. An initial set of
-  20 candidate titles was selected during brainstorming (mix of
-  long-running titles with deep discount history, and recent releases);
-  expanding to 100 is a build-time curation task, not enumerated here.
-- **Identity resolution**: a hand-maintained crosswalk, not automated
-  matching. Stored as a version-controlled seed file in the repo (CSV or
-  YAML), loaded into an Iceberg `dim_game` table by a batch job. Schema:
+- **Watchlist: 350 games total, split across three coverage tiers**:
+  - **Mutual (`BOTH`)**: on both Steam (PC) and PS5, standard edition —
+    the count here, `M`, is determined by how many titles the discovery
+    process (below) can actually find and verify, not fixed in advance.
+    An initial set of 20 candidate titles was already selected and
+    partly verified during brainstorming (a mix of long-running titles
+    with deep discount history and recent releases) and seeds this tier.
+  - **Steam-exclusive (`STEAM_ONLY`)**: on PC only. Count: `y`.
+  - **PS5-exclusive (`PS5_ONLY`)**: on PS5 only. Count: `y`.
+  - Where `y = (350 - M) / 2` — the two exclusive tiers are kept equal in
+    size, for a balanced platform-level comparison.
+  - These exclusive tiers exist specifically to support the broader
+    platform-level questions in Goals (discount strategy by platform,
+    exclusives vs. multiplatform) — they can't participate in
+    item-level cross-platform comparison the way `BOTH` games can.
+
+- **Discovery process** (build-time, produces the `dim_game` seed data):
+  run three separate queries against RAWG's platform filter — games
+  tagged PC **and** PS5 (candidates for `BOTH`), PC **not** PS5
+  (candidates for `STEAM_ONLY`), PS5 **not** PC (candidates for
+  `PS5_ONLY`) — then confirm each candidate's current listing via
+  Steam's and/or PlatPrices' own search endpoints. Clean, unambiguous
+  title matches are auto-accepted; anything ambiguous (sequels, "Complete
+  Edition" vs. base game, remasters) goes through a manual review pass
+  before being added. The output is still a version-controlled seed file
+  in the repo (CSV/YAML) — generated rather than hand-typed, but just as
+  editable/correctable afterward.
+
+- **Identity resolution / `dim_game`**: loaded from the seed file into
+  Iceberg by a batch job. Schema:
 
   ```
   dim_game (
     game_key          STRING,   -- canonical id, e.g. "elden_ring"
     canonical_name    STRING,
-    steam_appid       INT,
-    platprices_ppid   STRING,   -- PS5, standard edition
+    coverage          STRING,   -- "BOTH" | "STEAM_ONLY" | "PS5_ONLY"
+    steam_appid       INT,      -- null if coverage = "PS5_ONLY"
+    platprices_ppid   STRING,   -- null if coverage = "STEAM_ONLY"; PS5, standard edition
     rawg_id           INT,
     added_date        DATE
   )
   ```
 
-  This table is the join key for every cross-platform comparison in
+  `coverage` drives which collector(s) poll a given game (a
+  `STEAM_ONLY` row is never sent to the PlatPrices collector, and vice
+  versa), and it's the join key for every cross-platform comparison in
   Silver/Gold — Steam facts arrive keyed by `steam_appid`, PlatPrices
-  facts by `ppid`; `dim_game` is what makes them comparable.
+  facts by `ppid`; `dim_game` is what makes `BOTH`-coverage games
+  comparable, while `STEAM_ONLY`/`PS5_ONLY` games feed the platform-level
+  aggregates instead.
 
 ## Regions and currency
 
@@ -139,7 +174,9 @@ Steam supports this via its `cc` query parameter directly; PlatPrices
 supports it via its `region` parameter, within its free-tier limit of 2
 regions — matching exactly. (Whether PlatPrices' region list uses the
 code `IL` needs a live check against its `/regions` endpoint — see
-Risks.)
+Risks.) Each collector only queries the regions for games actually in
+its scope per `dim_game.coverage` (see Scope) — e.g. a `STEAM_ONLY` game
+never generates a PlatPrices call in either region.
 
 Every fact row (Steam and PlatPrices) is stored with its **region** and
 **native currency** as collected, for fidelity. For comparison purposes
@@ -164,12 +201,23 @@ below.
 
 ## Polling cadence
 
-| Source | Cadence | Why |
-|---|---|---|
-| Steam | Every 4-6h, per region (IL + US) | Not budget-constrained. Driven by how often real discounts actually rotate (roughly daily, with occasional flash sales) — polling much more often just produces redundant "no change" observations. |
-| PlatPrices | Daily, via `/games/batch`, per region (IL + US) | Budget-constrained: PlatPrices charges one quota unit per call regardless of how many records it returns, and the free tier pages at 25 records/page. For 100 games that's `ceil(100/25) = 4` batch calls per region per day → 8 calls/day ≈ 240/month — still well inside the 1,000/month free tier. |
-| RAWG | Weekly | Metadata for already-released games is effectively static; weekly is generous freshness margin at negligible API cost. |
-| ITAD (backfill) | One-time initial load, re-synced periodically (e.g. monthly) | It's historical data by nature — no need for frequent polling once the initial backfill lands. |
+Both price sources poll **daily** (not more often): real discounts
+rotate at most about once a day on Steam, and PS Store sale campaigns
+run for days to weeks once started, so daily polling catches essentially
+every real price change — more frequent polling would mostly produce
+redundant "no change" observations, so the budget is better spent on
+watchlist breadth than on freshness.
+
+| Source | Games polled | Cadence | Why |
+|---|---|---|---|
+| Steam | `BOTH` + `STEAM_ONLY` = `M + y` games, per region (IL + US) | Daily | Not budget-constrained, but no real-world benefit to polling more often than discounts actually change. |
+| PlatPrices | `BOTH` + `PS5_ONLY` = `M + y` games, per region (IL + US), via `/games/batch` | Daily | Budget-constrained: one quota unit per batch call regardless of records returned, 25 records/page on the free tier. Monthly cost: `ceil((M+y)/25) × 2 regions × 30 days`. Since `M + y = (M + 350) / 2` (see Scope) and `M` ranges from 0 to 350, this is bounded above by its worst case at `M = 350` (all mutual, no exclusives): `ceil(350/25) × 2 × 30 = 840/month`. So the full range of possible outcomes from the discovery process — however many mutual titles it actually finds — stays comfortably inside the 1,000/month free tier. |
+| RAWG | All 350 games | Weekly | Metadata for already-released games is effectively static; weekly is generous freshness margin at negligible API cost (~20k/month budget, not binding). |
+| ITAD (backfill) | `BOTH` + `STEAM_ONLY` = `M + y` games (PC side only) | One-time initial load, re-synced periodically (e.g. monthly) | It's historical data by nature — no need for frequent polling once the initial backfill lands. |
+
+Note: both collectors end up polling the same number of games (`M + y`)
+by construction, since the two exclusive tiers are equal-sized — they
+just poll different, overlapping-at-`BOTH` subsets of the 350-game list.
 
 ## Architecture
 
@@ -177,7 +225,7 @@ below.
 Airflow DAGs                  Kafka                 Spark                          Iceberg (on MinIO)          ClickHouse
 ┌──────────────────┐   ┌──────────────────┐  ┌──────────────────────┐      ┌─────────────────────┐    ┌──────────────┐
 │ steam_collector   │──▶│raw.steam.prices  │─▶│                      │Bronze▶│ bronze.* (append)    │    │              │
-│ (every 4-6h)      │   ├──────────────────┤  │ Bronze: continuous    │      ├─────────────────────┤    │              │
+│ (daily, batched)  │   ├──────────────────┤  │ Bronze: continuous    │      ├─────────────────────┤    │              │
 │ platprices_coll.  │──▶│raw.platprices    │─▶│ Structured Streaming  │      │ dim_game (seed load)  │    │              │
 │ (daily, batched)  │   ├──────────────────┤  │ (long-running service,│Silver▶│ silver.* (MERGE,      │sync▶│  ClickHouse  │
 │ rawg_collector    │──▶│raw.rawg.metadata │─▶│ outside Airflow)       │      │  change events)       │    │  (MergeTree) │
@@ -231,7 +279,7 @@ full from Iceberg's current state. Gold's tables are cumulative (every
 historical observation retained), so a naive incremental append without
 a watermark would re-insert the full history on top of itself every run,
 duplicating it daily. Truncate-and-reload can't produce that bug, and at
-this data volume (100 games, a handful of rows/game/day) the "wasted"
+this data volume (350 games, a handful of rows/game/day) the "wasted"
 re-read is immaterial. A true incremental sync (tracking the last-synced
 Iceberg snapshot ID, appending only new rows) is a reasonable v2 upgrade
 and a good excuse to exercise Iceberg's incremental-read support, but
@@ -286,14 +334,18 @@ scope; Metabase/Superset is a plausible future add-on.
 
 ## What's left to the builder
 
-- The remaining ~80 games for the watchlist (20 were already selected
-  during brainstorming; the schema and curation process are defined
-  here, the specific titles are not).
+- Running the three-tier discovery process against RAWG/Steam/PlatPrices
+  to actually populate `dim_game` (20 `BOTH`-tier titles are already
+  selected from brainstorming and seed that tier; the rest, and the
+  `STEAM_ONLY`/`PS5_ONLY` tiers, come from the discovery process defined
+  in Scope, including the manual-review pass for ambiguous matches).
 - Exact Kafka message schemas (JSON payload shape) per source.
 - The Deal Quality Score formula — a reasonable first version (weighted
   combination of distance from historical low, typical discount depth,
   and sale frequency) should be proposed during planning and iterated on
-  once real data exists, rather than finalized speculatively here.
+  once real data exists, rather than finalized speculatively here. The
+  platform-level aggregate formulas (e.g. "average discount depth by
+  platform/coverage tier") are likewise left to planning.
 - Iceberg REST catalog image choice and exact Postgres schema layout.
 - Airflow DAG file structure and task definitions.
 - Choice of Kafka UI vs. Redpanda Console for observability (either is
