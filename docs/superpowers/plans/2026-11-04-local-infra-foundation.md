@@ -303,6 +303,7 @@ spark.sql("""
         id INT, message STRING
     ) USING iceberg
 """)
+spark.sql("DELETE FROM lakehouse.smoke.ping")
 spark.sql("INSERT INTO lakehouse.smoke.ping VALUES (1, 'hello-iceberg')")
 
 result = spark.sql("SELECT * FROM lakehouse.smoke.ping").collect()
