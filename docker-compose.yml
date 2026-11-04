@@ -173,6 +173,24 @@ services:
     ports:
       - "8082:8081"
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "8123:8123"
+      - "9010:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
 volumes:
   postgres-data:
   localstack-data:

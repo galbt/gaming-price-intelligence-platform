@@ -439,7 +439,7 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
       - "8123:8123"
       - "9010:9000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -459,15 +459,15 @@ Expected: `docker compose ps clickhouse` shows `Up (healthy)`.
 Run:
 ```bash
 docker compose exec clickhouse clickhouse-client --query "
-  SELECT * FROM icebergS3(
+  SELECT * FROM iceberg(
     'http://localstack:4566/warehouse/smoke/ping/',
     'test', 'test'
   )
 "
 ```
-(Credentials are the literal `.env` values from Step 1 of Task 1, inlined here because this command runs in the host shell, which doesn't read `.env` the way `docker compose` does.)
+(Credentials are the literal `.env` values from Step 1 of Task 1, inlined here because this command runs in the host shell, which doesn't read `.env` the way `docker compose` does. The function is `iceberg(...)`, not `icebergS3(...)` — confirmed against ClickHouse 24.8's `system.table_functions`; this was the version-sensitivity risk flagged in Global Constraints, now resolved for this pinned version.)
 
-Expected: output is one row, `1\thello-iceberg`. If this exact function call errors on the installed ClickHouse version, check `clickhouse-client --query "SELECT * FROM system.functions WHERE name ILIKE '%iceberg%'"` for the available function/engine name on this version and adjust the call accordingly — this is the version-sensitivity risk flagged in Global Constraints.
+Expected: output is one row, `1\thello-iceberg`.
 
 - [ ] **Step 4: Commit**
 
