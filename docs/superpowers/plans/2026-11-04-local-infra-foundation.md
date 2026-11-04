@@ -6,7 +6,7 @@
 
 **Architecture:** Four incremental layers, each proven before the next is added: (1) the "dumb" storage/messaging primitives (Postgres, LocalStack, Kafka), (2) the lakehouse (Iceberg REST catalog + Spark, proven with a real write/read round trip through LocalStack), (3) the serving warehouse (ClickHouse, proven to read the table Spark just wrote), (4) the orchestrator (Airflow, proven to reach the other services over the compose network).
 
-**Tech Stack:** Docker Compose, PostgreSQL 16, LocalStack, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (Bitnami image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
+**Tech Stack:** Docker Compose, PostgreSQL 16, LocalStack, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (official `apache/spark` image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
 
 **Spec:** `docs/superpowers/specs/2026-11-03-gaming-price-intelligence-design.md`
 
@@ -31,7 +31,7 @@
 | Kafka | `apache/kafka` | `3.8.0` |
 | Kafka UI | `provectuslabs/kafka-ui` | `v0.7.2` |
 | Iceberg REST catalog | `tabulario/iceberg-rest` | `1.6.0` |
-| Spark | `bitnami/spark` | `3.5.3` |
+| Spark | `apache/spark` | `3.5.3` |
 | Iceberg Spark runtime | `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12` | `1.6.1` |
 | Hadoop AWS connector | `org.apache.hadoop:hadoop-aws` | `3.3.4` |
 | AWS SDK bundle | `com.amazonaws:aws-java-sdk-bundle` | `1.12.262` |
@@ -43,6 +43,7 @@
 - Kafka's exact KRaft env-var names (Task 1).
 - LocalStack's exact persistence env-var contract and health-endpoint response shape for the installed version (Task 1) — this plan was corrected mid-execution to replace MinIO (whose free Docker images were discontinued) with LocalStack; see the ledger for that ruling.
 - The Iceberg REST catalog image's exact env-var names for its JDBC/S3 config (Task 2).
+- Spark was corrected mid-execution too: `bitnami/spark` no longer has current tags on Docker Hub (Bitnami moved free images to an unmaintained `bitnamilegacy` namespace in 2025-2026). Replaced with the official `apache/spark` image, run in standalone mode directly via `spark-class` rather than Bitnami's `SPARK_MODE` env-var convention; see the ledger for that ruling.
 - ClickHouse's exact `icebergS3()` table function signature for the installed version (Task 3).
 
 ## Review Focus
@@ -166,6 +167,7 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
     entrypoint: ["/bin/sh", "-c"]
     command: ["aws --endpoint-url=http://localstack:4566 s3 mb s3://warehouse || true"]
 
@@ -283,7 +285,7 @@ spark.sql.catalog.lakehouse.s3.path-style-access=true
 spark.hadoop.fs.s3a.endpoint=http://localstack:4566
 spark.hadoop.fs.s3a.path.style.access=true
 spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
-spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
 ```
 
 Note: `fs.s3a.access.key` / `fs.s3a.secret.key` and the Iceberg catalog's AWS credentials are supplied as environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) on the Spark containers in Step 3, not hardcoded here — both the S3A connector and Iceberg's `S3FileIO` fall back to the standard AWS env vars automatically.
@@ -324,6 +326,7 @@ spark.stop()
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
       CATALOG_JDBC_USER: ${POSTGRES_USER}
@@ -335,59 +338,62 @@ spark.stop()
     ports:
       - "8181:8181"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8181'"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   spark-master:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "0.0.0.0"]
     environment:
-      SPARK_MODE: master
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       iceberg-rest:
         condition: service_healthy
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
       - ./infra/spark:/opt/spark-apps
     ports:
       - "7077:7077"
       - "8080:8080"
 
   spark-worker-1:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "2G", "--host", "0.0.0.0"]
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 2G
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       - spark-master
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     ports:
       - "8081:8081"
 
   spark-worker-2:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "2G", "--host", "0.0.0.0"]
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 2G
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       - spark-master
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     ports:
       - "8082:8081"
 ```
@@ -399,7 +405,7 @@ Expected: `docker compose ps` shows all four as `Up`; `http://localhost:8080` (S
 
 - [ ] **Step 5: Run the smoke test**
 
-Run: `docker compose exec spark-master spark-submit --master spark://spark-master:7077 /opt/spark-apps/smoke_test.py`
+Run: `docker compose exec spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-apps/smoke_test.py`
 Expected: stdout includes `SMOKE TEST PASSED`. (First run will take longer while `spark.jars.packages` downloads dependencies.)
 
 - [ ] **Step 6: Commit**
