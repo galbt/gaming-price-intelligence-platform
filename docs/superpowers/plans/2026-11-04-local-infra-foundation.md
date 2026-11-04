@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stand up the full local docker-compose stack (Postgres, MinIO, Kafka, Iceberg REST catalog, Spark standalone cluster, ClickHouse, Airflow) with every component proven to talk to its neighbors, so later plans can build real collectors and jobs on top of infrastructure that's already known to work.
+**Goal:** Stand up the full local docker-compose stack (Postgres, SeaweedFS, Kafka, Iceberg REST catalog, Spark standalone cluster, ClickHouse, Airflow) with every component proven to talk to its neighbors, so later plans can build real collectors and jobs on top of infrastructure that's already known to work.
 
-**Architecture:** Four incremental layers, each proven before the next is added: (1) the "dumb" storage/messaging primitives (Postgres, MinIO, Kafka), (2) the lakehouse (Iceberg REST catalog + Spark, proven with a real write/read round trip through MinIO), (3) the serving warehouse (ClickHouse, proven to read the table Spark just wrote), (4) the orchestrator (Airflow, proven to reach the other services over the compose network).
+**Architecture:** Four incremental layers, each proven before the next is added: (1) the "dumb" storage/messaging primitives (Postgres, SeaweedFS, Kafka), (2) the lakehouse (Iceberg REST catalog + Spark, proven with a real write/read round trip through SeaweedFS), (3) the serving warehouse (ClickHouse, proven to read the table Spark just wrote), (4) the orchestrator (Airflow, proven to reach the other services over the compose network).
 
-**Tech Stack:** Docker Compose, PostgreSQL 16, MinIO, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (Bitnami image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
+**Tech Stack:** Docker Compose, PostgreSQL 16, SeaweedFS, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (official `apache/spark` image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
 
 **Spec:** `docs/superpowers/specs/2026-11-03-gaming-price-intelligence-design.md`
 
@@ -16,7 +16,7 @@
 - Kafka runs in KRaft mode — no Zookeeper. [spec: Architecture — Kafka]
 - Iceberg catalog is a REST catalog backed by Postgres, not Nessie or a Hive metastore (spec left this as the default; this plan locks it in). [spec: What's left to the builder]
 - Spark runs as a standalone cluster (1 master + 2 workers), sized for a laptop: 1-2 cores / ~2GB RAM per worker. [spec: Architecture — Spark]
-- MinIO is the local S3-compatible object store backing the Iceberg warehouse. [spec: Architecture — Iceberg]
+- SeaweedFS is the local S3-compatible object store backing the Iceberg warehouse. [spec: Architecture — Iceberg]
 - ClickHouse is the serving warehouse and must be able to read Iceberg tables natively (via its built-in Iceberg table function), not just via a separate sync tool. [spec: Architecture — ClickHouse]
 - Airflow uses the same Postgres instance as the Iceberg catalog, in a separate database, to limit the number of containers on a laptop. [spec: Architecture — Airflow]
 - No service may use hardcoded credentials inside `docker-compose.yml` — all secrets come from `.env` (gitignored), referenced via `${VAR}` substitution.
@@ -26,12 +26,12 @@
 | Component | Image / package | Version |
 |---|---|---|
 | Postgres | `postgres` | `16` |
-| MinIO | `minio/minio` | `RELEASE.2024-10-13T13-34-11Z` |
-| MinIO Client | `minio/mc` | `RELEASE.2024-10-13T08-09-37Z` |
+| SeaweedFS | `chrislusf/seaweedfs` | `3.74` |
+| AWS CLI (bucket init only) | `amazon/aws-cli` | `2.17.62` |
 | Kafka | `apache/kafka` | `3.8.0` |
 | Kafka UI | `provectuslabs/kafka-ui` | `v0.7.2` |
 | Iceberg REST catalog | `tabulario/iceberg-rest` | `1.6.0` |
-| Spark | `bitnami/spark` | `3.5.3` |
+| Spark | `apache/spark` | `3.5.3` |
 | Iceberg Spark runtime | `org.apache.iceberg:iceberg-spark-runtime-3.5_2.12` | `1.6.1` |
 | Hadoop AWS connector | `org.apache.hadoop:hadoop-aws` | `3.3.4` |
 | AWS SDK bundle | `com.amazonaws:aws-java-sdk-bundle` | `1.12.262` |
@@ -41,13 +41,15 @@
 
 **Known configuration risks** — these are my best-known working configuration for each image, but I can't run them live to verify from here. If a step's exact command/env-var contract doesn't match the installed image's behavior, consult that image's current README/docs for the equivalent, rather than guessing:
 - Kafka's exact KRaft env-var names (Task 1).
+- The object store went through two corrections: MinIO (whose free Docker images were discontinued) was first replaced with LocalStack, then — found during the final whole-branch review — LocalStack Community turned out unable to persist data at all (confirmed live: the bucket vanishes on every container restart), so it was replaced again with SeaweedFS. See the ledger for both rulings.
 - The Iceberg REST catalog image's exact env-var names for its JDBC/S3 config (Task 2).
-- ClickHouse's exact `icebergS3()` table function signature for the installed version (Task 3).
+- Spark was corrected mid-execution too: `bitnami/spark` no longer has current tags on Docker Hub (Bitnami moved free images to an unmaintained `bitnamilegacy` namespace in 2025-2026). Replaced with the official `apache/spark` image, run in standalone mode directly via `spark-class` rather than Bitnami's `SPARK_MODE` env-var convention; see the ledger for that ruling.
+- ClickHouse's exact Iceberg table function is `iceberg(...)`, not `icebergS3(...)` — confirmed against ClickHouse 24.8.
 
 ## Review Focus
 
-- **Cold start / restart race conditions**: a dependent service (e.g. Iceberg REST catalog) starting before Postgres or MinIO is actually ready to accept connections, and failing instead of waiting. Covered by: Task 1's healthchecks + restart-cycle test, reused by every later task's `depends_on`.
-- **Idempotent re-runs**: running `docker compose up` a second time against already-initialized state (existing MinIO bucket, existing Postgres databases) should not error. Covered by: Task 1's restart-cycle test.
+- **Cold start / restart race conditions**: a dependent service (e.g. Iceberg REST catalog) starting before Postgres or SeaweedFS is actually ready to accept connections, and failing instead of waiting. Covered by: Task 1's healthchecks + restart-cycle test, reused by every later task's `depends_on`.
+- **Idempotent re-runs**: running `docker compose up` a second time against already-initialized state (existing SeaweedFS bucket, existing Postgres databases) should not error. Covered by: Task 1's restart-cycle test.
 - **Committed secrets**: default or hardcoded credentials ending up inside `docker-compose.yml` or git history instead of `.env`. Covered by: Task 1's `.env`/gitignore check.
 - **Host port collisions**: two services mapped to the same host port, or a chosen port colliding with something already running on the developer's machine. Covered by: Task 1 documents the intended port map (which later tasks must follow); Task 4's Step 6 runs the actual uniqueness check once the full compose file exists.
 - **Cross-component version incompatibility**: the Iceberg REST catalog's spec version, Spark's Iceberg runtime, and ClickHouse's Iceberg reader disagreeing about table format details. Covered by: Task 2's write/read round trip and Task 3's ClickHouse read — if these pass, the three components are provably compatible with each other; no separate test needed.
@@ -55,20 +57,21 @@
 
 ---
 
-## Task 1: Core data services — Postgres, MinIO, Kafka
+## Task 1: Core data services — Postgres, SeaweedFS, Kafka
 
 **Files:**
 - Create: `docker-compose.yml`
 - Create: `.env.example`
 - Create: `.gitignore`
 - Create: `infra/postgres/init-multiple-dbs.sh`
+- Create: `infra/seaweedfs/s3-config.json`
 
 **Interfaces:**
 - Consumes: nothing (first task).
 - Produces (for later tasks):
-  - Postgres at `postgres:5432` (internal) / `localhost:5432` (host), databases `postgres`, `iceberg_catalog`, `airflow`, credentials `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`.
-  - MinIO S3 API at `minio:9000` (internal) / `localhost:9000` (host), console at `localhost:9001`, bucket `warehouse` already created, credentials `${MINIO_ROOT_USER}` / `${MINIO_ROOT_PASSWORD}`.
-  - Kafka broker at `kafka:9092` (internal) / `localhost:9092` (host).
+  - Postgres at `postgres:5432` (internal) / `localhost:5433` (host — 5432 was already taken by an unrelated project on this machine), databases `postgres`, `iceberg_catalog`, `airflow`, credentials `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`.
+  - SeaweedFS S3 API at `seaweedfs:8333` (internal) / `localhost:8333` (host), bucket `warehouse` already created, credentials `${AWS_ACCESS_KEY_ID}` / `${AWS_SECRET_ACCESS_KEY}` / `${AWS_DEFAULT_REGION}`, matched against the identity configured in `infra/seaweedfs/s3-config.json`.
+  - Kafka broker at `kafka:9092` (internal) / `localhost:9092` **or** `localhost:29092` (host — two listeners; see Step 3).
   - Kafka UI at `localhost:8089`.
   - Finalized host port map (see Step 1) that every later task must follow without reusing a port.
 
@@ -85,17 +88,35 @@ __pycache__/
 ```
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
-MINIO_ROOT_USER=minioadmin
-MINIO_ROOT_PASSWORD=minioadmin123
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+AWS_DEFAULT_REGION=us-east-1
+```
+
+(`test`/`test` must match the identity configured in `infra/seaweedfs/s3-config.json` below — SeaweedFS rejects signed requests from credentials it doesn't recognize, unlike LocalStack's old anonymous-accepts-anything behavior.)
+
+Write `infra/seaweedfs/s3-config.json`:
+```json
+{
+  "identities": [
+    {
+      "name": "dev",
+      "credentials": [
+        {"accessKey": "test", "secretKey": "test"}
+      ],
+      "actions": ["Admin", "Read", "Write"]
+    }
+  ]
+}
 ```
 
 Host port map locked in by this plan (record as a comment block at the top of `docker-compose.yml` once it exists):
 ```
 # Host port map — keep every later addition unique against this list:
-#   5432  postgres
-#   9000  minio (S3 API)
-#   9001  minio (console)
-#   9092  kafka
+#   5433  postgres (host 5432 was already taken by an unrelated project)
+#   8333  seaweedfs (S3 gateway)
+#   9092  kafka (internal advertised listener)
+#   29092 kafka (host-reachable listener)
 #   8089  kafka-ui
 #   8181  iceberg-rest        (Task 2)
 #   7077  spark-master (RPC)  (Task 2)
@@ -119,7 +140,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
 EOSQL
 ```
 
-- [ ] **Step 3: Write `docker-compose.yml` with postgres, minio, minio-init, kafka, kafka-ui**
+- [ ] **Step 3: Write `docker-compose.yml` with postgres, seaweedfs, seaweedfs-init, kafka, kafka-ui**
+
+(Final review found two Critical/Important issues in this block after the rest of the plan's tasks were built on it: SeaweedFS Community cannot persist data at all — confirmed live, the bucket vanishes on every container restart — and the Postgres healthcheck could pass before the real server was ready. Both are fixed in the content below; see the ledger's `Final: fixed` entries.)
 
 ```yaml
 services:
@@ -132,55 +155,66 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
     ports:
-      - "5432:5432"
+      - "5433:5432"
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  minio:
-    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.74
+    command: ["server", "-dir=/data", "-s3", "-ip=seaweedfs", "-s3.config=/etc/seaweedfs/s3-config.json"]
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
+      - ./infra/seaweedfs/s3-config.json:/etc/seaweedfs/s3-config.json
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "8333:8333"
+    mem_limit: 1g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8333/; test $$? -ne 4"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+      start_period: 30s
 
-  minio-init:
-    image: minio/mc:RELEASE.2024-10-13T08-09-37Z
+  seaweedfs-init:
+    image: amazon/aws-cli:2.17.62
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
-      mc mb --ignore-existing local/warehouse
-      "
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["aws --endpoint-url=http://seaweedfs:8333 s3api head-bucket --bucket warehouse || aws --endpoint-url=http://seaweedfs:8333 s3 mb s3://warehouse"]
+    restart: on-failure
 
   kafka:
     image: apache/kafka:3.8.0
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     ports:
       - "9092:9092"
+      - "29092:29092"
+    mem_limit: 1536m
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
       interval: 10s
@@ -197,23 +231,26 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
       - "8089:8080"
+    mem_limit: 512m
+    restart: on-failure
 
 volumes:
   postgres-data:
-  minio-data:
+  seaweedfs-data:
+  kafka-data:
 ```
 
 - [ ] **Step 4: Bring the stack up and verify Postgres**
 
-Run: `cp .env.example .env && docker compose up -d postgres minio minio-init kafka kafka-ui`
+Run: `cp .env.example .env && docker compose up -d postgres seaweedfs seaweedfs-init kafka kafka-ui`
 
 Then: `docker compose exec postgres psql -U postgres -l`
 Expected: output lists `postgres`, `iceberg_catalog`, and `airflow` as databases.
 
-- [ ] **Step 5: Verify MinIO bucket creation**
+- [ ] **Step 5: Verify SeaweedFS bucket creation**
 
-Run: `docker compose logs minio-init`
-Expected: output includes a line confirming the `warehouse` bucket exists (either "created" or already-exists, since `--ignore-existing` was used), and `docker compose ps minio-init` shows exit code `0`.
+Run: `docker compose logs seaweedfs-init`
+Expected: output shows the bucket already exists (head-bucket succeeds) or gets created (`make_bucket: warehouse`), and `docker compose ps -a seaweedfs-init` shows exit code `0` either way — the command tries `head-bucket` first and only runs `mb` if that fails, so it's idempotent across restarts.
 
 - [ ] **Step 6: Verify Kafka produce/consume**
 
@@ -237,14 +274,14 @@ Expected: first command exits `0` (`.env` is ignored); second command's count is
 
 - [ ] **Step 9: Verify clean restart (idempotency)**
 
-Run: `docker compose down && docker compose up -d postgres minio minio-init kafka kafka-ui`
+Run: `docker compose down && docker compose up -d postgres seaweedfs seaweedfs-init kafka kafka-ui`
 Expected: all five services reach a running/completed state again with no errors in `docker compose logs`, and repeating Step 4's database check still shows all three databases (Postgres data persisted via the named volume).
 
 - [ ] **Step 10: Commit**
 
 ```bash
-git add docker-compose.yml .env.example .gitignore infra/postgres/init-multiple-dbs.sh
-git commit -m "infra: add Postgres, MinIO, and Kafka (KRaft) to local stack"
+git add docker-compose.yml .env.example .gitignore infra/postgres/init-multiple-dbs.sh infra/seaweedfs/s3-config.json
+git commit -m "infra: add Postgres, SeaweedFS, and Kafka (KRaft) to local stack"
 ```
 
 ---
@@ -255,14 +292,15 @@ git commit -m "infra: add Postgres, MinIO, and Kafka (KRaft) to local stack"
 - Modify: `docker-compose.yml` (add `iceberg-rest`, `spark-master`, `spark-worker-1`, `spark-worker-2`)
 - Create: `infra/spark/spark-defaults.conf`
 - Create: `infra/spark/smoke_test.py`
+- Create: `infra/spark/shuffle_test.py`
 
 **Interfaces:**
-- Consumes: Task 1's `postgres:5432` (databases `iceberg_catalog`), `minio:9000` (bucket `warehouse`), and their credentials.
+- Consumes: Task 1's `postgres:5432` (databases `iceberg_catalog`), `seaweedfs:8333` (bucket `warehouse`), and their credentials.
 - Produces (for later tasks and Task 3):
   - Iceberg REST catalog at `iceberg-rest:8181` (internal) / `localhost:8181`.
   - Spark catalog name `lakehouse` (configured in `spark-defaults.conf`), pointing at the REST catalog and `s3a://warehouse/`.
   - Spark master at `spark-master:7077` (internal), UI at `localhost:8080`; workers' UIs at `localhost:8081` / `localhost:8082`.
-  - A proven table `lakehouse.smoke.ping`, physically present under `s3://warehouse/smoke/ping/` in MinIO — this is what Task 3 reads from ClickHouse.
+  - A proven table `lakehouse.smoke.ping`, physically present under `s3://warehouse/smoke/ping/` in SeaweedFS — this is what Task 3 reads from ClickHouse.
 
 - [ ] **Step 1: Write `infra/spark/spark-defaults.conf`**
 
@@ -273,12 +311,12 @@ spark.sql.catalog.lakehouse.catalog-impl=org.apache.iceberg.rest.RESTCatalog
 spark.sql.catalog.lakehouse.uri=http://iceberg-rest:8181
 spark.sql.catalog.lakehouse.warehouse=s3a://warehouse/
 spark.sql.catalog.lakehouse.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-spark.sql.catalog.lakehouse.s3.endpoint=http://minio:9000
+spark.sql.catalog.lakehouse.s3.endpoint=http://seaweedfs:8333
 spark.sql.catalog.lakehouse.s3.path-style-access=true
-spark.hadoop.fs.s3a.endpoint=http://minio:9000
+spark.hadoop.fs.s3a.endpoint=http://seaweedfs:8333
 spark.hadoop.fs.s3a.path.style.access=true
 spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
-spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
 ```
 
 Note: `fs.s3a.access.key` / `fs.s3a.secret.key` and the Iceberg catalog's AWS credentials are supplied as environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) on the Spark containers in Step 3, not hardcoded here — both the S3A connector and Iceberg's `S3FileIO` fall back to the standard AWS env vars automatically.
@@ -296,6 +334,7 @@ spark.sql("""
         id INT, message STRING
     ) USING iceberg
 """)
+spark.sql("DELETE FROM lakehouse.smoke.ping")
 spark.sql("INSERT INTO lakehouse.smoke.ping VALUES (1, 'hello-iceberg')")
 
 result = spark.sql("SELECT * FROM lakehouse.smoke.ping").collect()
@@ -313,91 +352,129 @@ spark.stop()
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
+      seaweedfs-init:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
       CATALOG_JDBC_USER: ${POSTGRES_USER}
       CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
     ports:
       - "8181:8181"
+    mem_limit: 512m
+    restart: on-failure
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8181'"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   spark-master:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master"]
     environment:
-      SPARK_MODE: master
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       iceberg-rest:
         condition: service_healthy
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
       - ./infra/spark:/opt/spark-apps
     ports:
       - "7077:7077"
       - "8080:8080"
+    mem_limit: 1g
+    restart: on-failure
 
   spark-worker-1:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "2G", "--host", "spark-worker-1"]
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 2G
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       - spark-master
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     ports:
       - "8081:8081"
+    mem_limit: 2500m
+    restart: on-failure
 
   spark-worker-2:
-    image: bitnami/spark:3.5.3
+    image: apache/spark:3.5.3
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "2G", "--host", "spark-worker-2"]
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 2G
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
+      HOME: /tmp
+      JAVA_TOOL_OPTIONS: -Duser.home=/tmp
     depends_on:
       - spark-master
     volumes:
-      - ./infra/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     ports:
       - "8082:8081"
+    mem_limit: 2500m
+    restart: on-failure
 ```
+
+(Final review found a Critical issue here: `--host 0.0.0.0` made each worker advertise itself as `0.0.0.0` to the others, which breaks shuffles between workers — confirmed live with a `FetchFailedException` on a real shuffle job. Each service now advertises its own container name instead, shown above. `mem_limit`/`restart` were also added per the review's resource-exhaustion and crash-recovery findings.)
 
 - [ ] **Step 4: Bring up the new services**
 
 Run: `docker compose up -d iceberg-rest spark-master spark-worker-1 spark-worker-2`
-Expected: `docker compose ps` shows all four as `Up`; `http://localhost:8080` (Spark master UI) shows 2 workers registered.
+Expected: `docker compose ps` shows all four as `Up`; `http://localhost:8080` (Spark master UI) shows 2 workers registered, each with its own hostname (not `0.0.0.0`) — check via `curl -s http://localhost:8080/json/`.
 
 - [ ] **Step 5: Run the smoke test**
 
-Run: `docker compose exec spark-master spark-submit --master spark://spark-master:7077 /opt/spark-apps/smoke_test.py`
+Run: `docker compose exec spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-apps/smoke_test.py`
 Expected: stdout includes `SMOKE TEST PASSED`. (First run will take longer while `spark.jars.packages` downloads dependencies.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Write and run a real shuffle test**
+
+The smoke test above has no shuffle (one row, one partition), so it can't catch a broken worker-to-worker data path — which is exactly what the `--host 0.0.0.0` bug in Step 3 caused. Write `infra/spark/shuffle_test.py`:
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("shuffle-test").getOrCreate()
+sc = spark.sparkContext
+
+result = sc.range(200000).repartition(8).map(lambda x: (x % 10, 1)).reduceByKey(lambda a, b: a + b).collect()
+assert len(result) == 10, f"unexpected result: {result}"
+
+print("SHUFFLE TEST PASSED")
+spark.stop()
+```
+
+Run: `docker compose exec spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-apps/shuffle_test.py`
+Expected: stdout includes `SHUFFLE TEST PASSED`, and no `FetchFailedException` or `Lost executor` lines appear anywhere in the output — either would mean a worker couldn't be reached by the others during the shuffle.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add docker-compose.yml infra/spark/
-git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with write/read smoke test"
+git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with write/read and shuffle tests"
 ```
 
 ---
@@ -408,8 +485,14 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
 - Modify: `docker-compose.yml` (add `clickhouse`)
 
 **Interfaces:**
-- Consumes: Task 2's `lakehouse.smoke.ping` table, physically at `s3://warehouse/smoke/ping/` in MinIO (`minio:9000`), and Task 1's MinIO credentials.
-- Produces: ClickHouse reachable at `clickhouse:8123` (internal) / `localhost:8123` (HTTP) and `localhost:9010` (native), proven able to read an Iceberg table directly from MinIO.
+- Consumes: Task 2's `lakehouse.smoke.ping` table, physically at `s3://warehouse/smoke/ping/` in SeaweedFS (`seaweedfs:8333`), and Task 1's SeaweedFS credentials.
+- Produces: ClickHouse reachable at `clickhouse:8123` (internal) / `localhost:8123` (HTTP) and `localhost:9010` (native), authenticated as `${CLICKHOUSE_USER}` / `${CLICKHOUSE_PASSWORD}`, proven able to read an Iceberg table directly from SeaweedFS — from the host and from other containers, not just from inside its own container.
+
+Append to `.env.example` (and generate real values in `.env`):
+```
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=clickhouse
+```
 
 - [ ] **Step 1: Add `clickhouse` to `docker-compose.yml`**
 
@@ -417,13 +500,19 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
       - "8123:8123"
       - "9010:9000"
+    mem_limit: 1g
+    restart: on-failure
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -433,29 +522,45 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
         hard: 262144
 ```
 
+(Final review found an Important issue here: without `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD`, ClickHouse 24.8 restricts its default user to localhost-only — confirmed live, `curl localhost:8123` from the host and from another container both returned `AUTHENTICATION_FAILED`/`403`, breaking the host/container access this task's Interfaces promise. Setting a real user+password with `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1` opens network access properly.)
+
 - [ ] **Step 2: Bring up ClickHouse**
 
 Run: `docker compose up -d clickhouse`
 Expected: `docker compose ps clickhouse` shows `Up (healthy)`.
 
-- [ ] **Step 3: Query the Iceberg table natively from ClickHouse**
+- [ ] **Step 3: Query the Iceberg table natively from ClickHouse — from inside, from the host, and from another container**
 
-Run:
+Run (inside the container, as the plan originally did):
 ```bash
-docker compose exec clickhouse clickhouse-client --query "
-  SELECT * FROM icebergS3(
-    'http://minio:9000/warehouse/smoke/ping/',
-    '${MINIO_ROOT_USER}', '${MINIO_ROOT_PASSWORD}'
+docker compose exec clickhouse clickhouse-client --user ${CLICKHOUSE_USER} --password ${CLICKHOUSE_PASSWORD} --query "
+  SELECT * FROM iceberg(
+    'http://seaweedfs:8333/warehouse/smoke/ping/',
+    'test', 'test'
   )
 "
 ```
-Expected: output is one row, `1\thello-iceberg`. If this exact function call errors on the installed ClickHouse version, check `clickhouse-client --query "SELECT * FROM system.functions WHERE name ILIKE '%iceberg%'"` for the available function/engine name on this version and adjust the call accordingly — this is the version-sensitivity risk flagged in Global Constraints.
+(Credentials are the literal `.env` values, inlined here because this command runs in the host shell, which doesn't read `.env` the way `docker compose` does. The function is `iceberg(...)`, not `icebergS3(...)` — confirmed against ClickHouse 24.8's `system.table_functions`; this was the version-sensitivity risk flagged in Global Constraints, now resolved for this pinned version.)
+
+Expected: output is one row, `1\thello-iceberg`.
+
+Then, from the host (proves the access this task's Interfaces promise, not just in-container access):
+```bash
+curl -s "http://default:clickhouse@localhost:8123/?query=SELECT%201"
+```
+Expected: `1`.
+
+Then, from another container on the network (e.g. `airflow-scheduler`, once Task 4 exists — otherwise any running container):
+```bash
+docker compose exec airflow-scheduler bash -c 'curl -s "http://default:clickhouse@clickhouse:8123/?query=SELECT%201"'
+```
+Expected: `1`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docker-compose.yml
-git commit -m "infra: add ClickHouse, proven to read Iceberg tables natively from MinIO"
+git add docker-compose.yml .env.example
+git commit -m "infra: add ClickHouse, proven to read Iceberg tables natively from SeaweedFS and reachable over the network"
 ```
 
 ---
@@ -470,17 +575,23 @@ git commit -m "infra: add ClickHouse, proven to read Iceberg tables natively fro
 - Consumes: Task 1's `postgres:5432` (database `airflow`), Task 2's `iceberg-rest:8181`.
 - Produces: Airflow webserver at `localhost:8090` (login `${AIRFLOW_ADMIN_USER}` / `${AIRFLOW_ADMIN_PASSWORD}`), scheduler running, DAG `smoke_test` proven to execute successfully end to end. Later plans' collector DAGs and the batch-chain DAG are added as sibling files under `infra/airflow/dags/`.
 
-- [ ] **Step 1: Add Airflow credentials and Fernet key to `.env.example`**
+- [ ] **Step 1: Add Airflow credentials, Fernet key, and webserver secret key to `.env.example`**
 
 Append to `.env.example`:
 ```
 AIRFLOW_ADMIN_USER=admin
 AIRFLOW_ADMIN_PASSWORD=admin
 AIRFLOW_FERNET_KEY=
+AIRFLOW_SECRET_KEY=
 ```
-Generate a real key for your own `.env` (not committed) with:
-`python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-and paste it as the value of `AIRFLOW_FERNET_KEY` in `.env`.
+Generate real values for your own `.env` (not committed) with:
+```
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python3 -c "import secrets; print(secrets.token_hex(16))"
+```
+and paste them as `AIRFLOW_FERNET_KEY` and `AIRFLOW_SECRET_KEY` respectively in `.env`.
+
+(Final review found an Important issue here: webserver and scheduler each generated their own random `AIRFLOW__WEBSERVER__SECRET_KEY` by default since neither had one set — confirmed live, their keys differed — which breaks viewing task logs in the UI for runs the scheduler executed (`403 Invalid signature`). All three Airflow services need the same explicit key, from Step 3 below.)
 
 - [ ] **Step 2: Write `infra/airflow/dags/smoke_test_dag.py`**
 
@@ -521,10 +632,12 @@ with DAG(
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
     entrypoint: /bin/bash
     command: >
       -c "airflow db migrate &&
       airflow users create --username ${AIRFLOW_ADMIN_USER} --password ${AIRFLOW_ADMIN_PASSWORD} --firstname admin --lastname admin --role Admin --email admin@example.com"
+    restart: on-failure
 
   airflow-webserver:
     image: apache/airflow:2.10.2
@@ -535,11 +648,14 @@ with DAG(
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
     volumes:
       - ./infra/airflow/dags:/opt/airflow/dags
     ports:
       - "8090:8080"
     command: webserver
+    mem_limit: 1536m
+    restart: on-failure
 
   airflow-scheduler:
     image: apache/airflow:2.10.2
@@ -550,9 +666,12 @@ with DAG(
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
     volumes:
       - ./infra/airflow/dags:/opt/airflow/dags
     command: scheduler
+    mem_limit: 1g
+    restart: on-failure
 ```
 
 - [ ] **Step 4: Bring up Airflow**
@@ -560,10 +679,19 @@ with DAG(
 Run: `docker compose up -d airflow-init airflow-webserver airflow-scheduler`
 Expected: `docker compose logs airflow-init` shows the admin user created with no errors; `docker compose ps` shows `airflow-webserver` and `airflow-scheduler` as `Up`.
 
-- [ ] **Step 5: Run the smoke test DAG**
+- [ ] **Step 5: Prove the DAG runs through the real scheduler, not just `dags test`**
 
-Run: `docker compose exec airflow-webserver airflow dags test smoke_test $(date +%F)`
-Expected: output shows the `check_iceberg_catalog_reachable` task succeeding and the DAG run finishing with no exceptions. (Log in at `http://localhost:8090` with `${AIRFLOW_ADMIN_USER}`/`${AIRFLOW_ADMIN_PASSWORD}` to see it visually, optional.)
+`airflow dags test` runs the DAG in its own process and skips the scheduler and `LocalExecutor` entirely — it never proves a scheduled run actually works. Use the real path instead:
+
+```bash
+docker compose exec airflow-webserver airflow dags unpause smoke_test
+docker compose exec airflow-webserver airflow dags trigger smoke_test
+```
+Wait a few seconds for the scheduler to pick it up, then:
+```bash
+docker compose exec airflow-webserver airflow dags list-runs -d smoke_test
+```
+Expected: the triggered run shows `state: success`. (Log in at `http://localhost:8090` with `${AIRFLOW_ADMIN_USER}`/`${AIRFLOW_ADMIN_PASSWORD}` and open the task's logs to confirm the shared secret key fix — this would show `403 Invalid signature` if the webserver and scheduler keys didn't match.)
 
 - [ ] **Step 6: Full-stack resource check and port-uniqueness check**
 
@@ -571,11 +699,11 @@ Run: `grep -oE '"[0-9]+:[0-9]+"' docker-compose.yml | cut -d: -f1 | tr -d '"' | 
 Expected: no output (an empty result means every host port in the finished compose file, across all four tasks, is unique — any line printed is a duplicate host port that must be fixed before continuing).
 
 Run: `docker compose up -d` (brings up every remaining service) followed by `docker compose ps` and `docker stats --no-stream`
-Expected: every service in `docker compose ps` shows `Up` (none `Restarting` or `Exited` from an OOM kill); `docker stats` shows no container pinned at its memory limit. If a container is being killed, lower `SPARK_WORKER_MEMORY` (Task 2) or stop non-essential services before running the full stack, and note the adjustment here.
+Expected: every service in `docker compose ps` shows `Up` (none `Restarting` or `Exited` from an OOM kill); `docker stats` shows no container pinned at its `mem_limit`. The `mem_limit` values set on each service throughout this plan are the actual safety net here — a runaway container gets killed on its own (`Exited (137)`) instead of the kernel OOM-killing an arbitrary process.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add docker-compose.yml .env.example infra/airflow/
-git commit -m "infra: add Airflow orchestration, proven reachable to the lakehouse"
+git commit -m "infra: add Airflow orchestration, proven reachable to the lakehouse via the real scheduler path"
 ```
