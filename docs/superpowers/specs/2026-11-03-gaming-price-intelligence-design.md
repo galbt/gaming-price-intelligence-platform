@@ -222,7 +222,7 @@ just poll different, overlapping-at-`BOTH` subsets of the 350-game list.
 ## Architecture
 
 ```
-Airflow DAGs                  Kafka                 Spark                          Iceberg (on MinIO)          ClickHouse
+Airflow DAGs                  Kafka                 Spark                          Iceberg (on LocalStack S3) ClickHouse
 ┌──────────────────┐   ┌──────────────────┐  ┌──────────────────────┐      ┌─────────────────────┐    ┌──────────────┐
 │ steam_collector   │──▶│raw.steam.prices  │─▶│                      │Bronze▶│ bronze.* (append)    │    │              │
 │ (daily, batched)  │   ├──────────────────┤  │ Bronze: continuous    │      ├─────────────────────┤    │              │
@@ -260,15 +260,19 @@ cores / ~2GB RAM per worker). Two distinct job types:
 
 Spark UI exposed (8080 master, 4040 per-application) for observability.
 
-**Iceberg** — table format on Parquet files stored in MinIO (local
-S3-compatible object storage). Catalog: Iceberg REST catalog backed by
+**Iceberg** — table format on Parquet files stored in LocalStack's S3
+emulation (local S3-compatible object storage; chosen over MinIO, whose
+free Docker images were pulled from Docker Hub and whose open-source
+distribution was discontinued in 2026 — see the infra-foundation plan's
+ledger for the full story). Catalog: Iceberg REST catalog backed by
 Postgres (the same Postgres instance also backs Airflow's metadata DB,
 in separate schemas, to limit the number of containers on a laptop).
 Bronze/Silver/Gold layering, plus the `dim_game` dimension table.
 
 **ClickHouse** — the serving warehouse. Gold Iceberg tables are synced
 into native ClickHouse `MergeTree` tables via ClickHouse's built-in
-Iceberg table function reading directly from MinIO (`INSERT INTO ...
+Iceberg table function reading directly from LocalStack's S3 emulation
+(`INSERT INTO ...
 SELECT * FROM icebergS3(...)`), run as the final task in the batch DAG.
 Chosen over Snowflake/OpenSearch-style simulation as the most realistic
 "runs great in one container on a laptop" option.
