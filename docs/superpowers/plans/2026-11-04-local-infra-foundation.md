@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stand up the full local docker-compose stack (Postgres, MinIO, Kafka, Iceberg REST catalog, Spark standalone cluster, ClickHouse, Airflow) with every component proven to talk to its neighbors, so later plans can build real collectors and jobs on top of infrastructure that's already known to work.
+**Goal:** Stand up the full local docker-compose stack (Postgres, LocalStack, Kafka, Iceberg REST catalog, Spark standalone cluster, ClickHouse, Airflow) with every component proven to talk to its neighbors, so later plans can build real collectors and jobs on top of infrastructure that's already known to work.
 
-**Architecture:** Four incremental layers, each proven before the next is added: (1) the "dumb" storage/messaging primitives (Postgres, MinIO, Kafka), (2) the lakehouse (Iceberg REST catalog + Spark, proven with a real write/read round trip through MinIO), (3) the serving warehouse (ClickHouse, proven to read the table Spark just wrote), (4) the orchestrator (Airflow, proven to reach the other services over the compose network).
+**Architecture:** Four incremental layers, each proven before the next is added: (1) the "dumb" storage/messaging primitives (Postgres, LocalStack, Kafka), (2) the lakehouse (Iceberg REST catalog + Spark, proven with a real write/read round trip through LocalStack), (3) the serving warehouse (ClickHouse, proven to read the table Spark just wrote), (4) the orchestrator (Airflow, proven to reach the other services over the compose network).
 
-**Tech Stack:** Docker Compose, PostgreSQL 16, MinIO, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (Bitnami image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
+**Tech Stack:** Docker Compose, PostgreSQL 16, LocalStack, Apache Kafka 3.8 (KRaft mode), Apache Iceberg 1.6 (REST catalog via `tabulario/iceberg-rest`), Apache Spark 3.5 (Bitnami image, standalone cluster), ClickHouse 24.8, Apache Airflow 2.10 (LocalExecutor).
 
 **Spec:** `docs/superpowers/specs/2026-11-03-gaming-price-intelligence-design.md`
 
@@ -16,7 +16,7 @@
 - Kafka runs in KRaft mode — no Zookeeper. [spec: Architecture — Kafka]
 - Iceberg catalog is a REST catalog backed by Postgres, not Nessie or a Hive metastore (spec left this as the default; this plan locks it in). [spec: What's left to the builder]
 - Spark runs as a standalone cluster (1 master + 2 workers), sized for a laptop: 1-2 cores / ~2GB RAM per worker. [spec: Architecture — Spark]
-- MinIO is the local S3-compatible object store backing the Iceberg warehouse. [spec: Architecture — Iceberg]
+- LocalStack is the local S3-compatible object store backing the Iceberg warehouse. [spec: Architecture — Iceberg]
 - ClickHouse is the serving warehouse and must be able to read Iceberg tables natively (via its built-in Iceberg table function), not just via a separate sync tool. [spec: Architecture — ClickHouse]
 - Airflow uses the same Postgres instance as the Iceberg catalog, in a separate database, to limit the number of containers on a laptop. [spec: Architecture — Airflow]
 - No service may use hardcoded credentials inside `docker-compose.yml` — all secrets come from `.env` (gitignored), referenced via `${VAR}` substitution.
@@ -26,8 +26,8 @@
 | Component | Image / package | Version |
 |---|---|---|
 | Postgres | `postgres` | `16` |
-| MinIO | `minio/minio` | `RELEASE.2024-10-13T13-34-11Z` |
-| MinIO Client | `minio/mc` | `RELEASE.2024-10-13T08-09-37Z` |
+| LocalStack | `localstack/localstack` | `3.8` |
+| AWS CLI (bucket init only) | `amazon/aws-cli` | `2.17.62` |
 | Kafka | `apache/kafka` | `3.8.0` |
 | Kafka UI | `provectuslabs/kafka-ui` | `v0.7.2` |
 | Iceberg REST catalog | `tabulario/iceberg-rest` | `1.6.0` |
@@ -41,13 +41,14 @@
 
 **Known configuration risks** — these are my best-known working configuration for each image, but I can't run them live to verify from here. If a step's exact command/env-var contract doesn't match the installed image's behavior, consult that image's current README/docs for the equivalent, rather than guessing:
 - Kafka's exact KRaft env-var names (Task 1).
+- LocalStack's exact persistence env-var contract and health-endpoint response shape for the installed version (Task 1) — this plan was corrected mid-execution to replace MinIO (whose free Docker images were discontinued) with LocalStack; see the ledger for that ruling.
 - The Iceberg REST catalog image's exact env-var names for its JDBC/S3 config (Task 2).
 - ClickHouse's exact `icebergS3()` table function signature for the installed version (Task 3).
 
 ## Review Focus
 
-- **Cold start / restart race conditions**: a dependent service (e.g. Iceberg REST catalog) starting before Postgres or MinIO is actually ready to accept connections, and failing instead of waiting. Covered by: Task 1's healthchecks + restart-cycle test, reused by every later task's `depends_on`.
-- **Idempotent re-runs**: running `docker compose up` a second time against already-initialized state (existing MinIO bucket, existing Postgres databases) should not error. Covered by: Task 1's restart-cycle test.
+- **Cold start / restart race conditions**: a dependent service (e.g. Iceberg REST catalog) starting before Postgres or LocalStack is actually ready to accept connections, and failing instead of waiting. Covered by: Task 1's healthchecks + restart-cycle test, reused by every later task's `depends_on`.
+- **Idempotent re-runs**: running `docker compose up` a second time against already-initialized state (existing LocalStack bucket, existing Postgres databases) should not error. Covered by: Task 1's restart-cycle test.
 - **Committed secrets**: default or hardcoded credentials ending up inside `docker-compose.yml` or git history instead of `.env`. Covered by: Task 1's `.env`/gitignore check.
 - **Host port collisions**: two services mapped to the same host port, or a chosen port colliding with something already running on the developer's machine. Covered by: Task 1 documents the intended port map (which later tasks must follow); Task 4's Step 6 runs the actual uniqueness check once the full compose file exists.
 - **Cross-component version incompatibility**: the Iceberg REST catalog's spec version, Spark's Iceberg runtime, and ClickHouse's Iceberg reader disagreeing about table format details. Covered by: Task 2's write/read round trip and Task 3's ClickHouse read — if these pass, the three components are provably compatible with each other; no separate test needed.
@@ -55,7 +56,7 @@
 
 ---
 
-## Task 1: Core data services — Postgres, MinIO, Kafka
+## Task 1: Core data services — Postgres, LocalStack, Kafka
 
 **Files:**
 - Create: `docker-compose.yml`
@@ -66,8 +67,8 @@
 **Interfaces:**
 - Consumes: nothing (first task).
 - Produces (for later tasks):
-  - Postgres at `postgres:5432` (internal) / `localhost:5432` (host), databases `postgres`, `iceberg_catalog`, `airflow`, credentials `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`.
-  - MinIO S3 API at `minio:9000` (internal) / `localhost:9000` (host), console at `localhost:9001`, bucket `warehouse` already created, credentials `${MINIO_ROOT_USER}` / `${MINIO_ROOT_PASSWORD}`.
+  - Postgres at `postgres:5432` (internal) / `localhost:5433` (host — 5432 was already taken by an unrelated project on this machine), databases `postgres`, `iceberg_catalog`, `airflow`, credentials `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`.
+  - LocalStack S3 API at `localstack:4566` (internal) / `localhost:4566` (host), bucket `warehouse` already created, credentials `${AWS_ACCESS_KEY_ID}` / `${AWS_SECRET_ACCESS_KEY}` / `${AWS_DEFAULT_REGION}`.
   - Kafka broker at `kafka:9092` (internal) / `localhost:9092` (host).
   - Kafka UI at `localhost:8089`.
   - Finalized host port map (see Step 1) that every later task must follow without reusing a port.
@@ -85,16 +86,18 @@ __pycache__/
 ```
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
-MINIO_ROOT_USER=minioadmin
-MINIO_ROOT_PASSWORD=minioadmin123
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+AWS_DEFAULT_REGION=us-east-1
 ```
+
+(`test`/`test` is the LocalStack community-edition convention — it doesn't enforce real AWS auth, but Spark's S3A connector and Iceberg's S3 client still require *some* non-empty credential pair to be present.)
 
 Host port map locked in by this plan (record as a comment block at the top of `docker-compose.yml` once it exists):
 ```
 # Host port map — keep every later addition unique against this list:
-#   5432  postgres
-#   9000  minio (S3 API)
-#   9001  minio (console)
+#   5433  postgres (host 5432 was already taken by an unrelated project)
+#   4566  localstack (S3 edge/gateway)
 #   9092  kafka
 #   8089  kafka-ui
 #   8181  iceberg-rest        (Task 2)
@@ -119,7 +122,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
 EOSQL
 ```
 
-- [ ] **Step 3: Write `docker-compose.yml` with postgres, minio, minio-init, kafka, kafka-ui**
+- [ ] **Step 3: Write `docker-compose.yml` with postgres, localstack, localstack-init, kafka, kafka-ui**
 
 ```yaml
 services:
@@ -132,40 +135,39 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  minio:
-    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
-    command: server /data --console-address ":9001"
+  localstack:
+    image: localstack/localstack:3.8
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      SERVICES: s3
+      PERSISTENCE: 1
     volumes:
-      - minio-data:/data
+      - localstack-data:/var/lib/localstack
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "4566:4566"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  minio-init:
-    image: minio/mc:RELEASE.2024-10-13T08-09-37Z
+  localstack-init:
+    image: amazon/aws-cli:2.17.62
     depends_on:
-      minio:
+      localstack:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
-      mc mb --ignore-existing local/warehouse
-      "
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["aws --endpoint-url=http://localstack:4566 s3 mb s3://warehouse || true"]
 
   kafka:
     image: apache/kafka:3.8.0
@@ -179,6 +181,9 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
     ports:
       - "9092:9092"
     healthcheck:
@@ -200,20 +205,20 @@ services:
 
 volumes:
   postgres-data:
-  minio-data:
+  localstack-data:
 ```
 
 - [ ] **Step 4: Bring the stack up and verify Postgres**
 
-Run: `cp .env.example .env && docker compose up -d postgres minio minio-init kafka kafka-ui`
+Run: `cp .env.example .env && docker compose up -d postgres localstack localstack-init kafka kafka-ui`
 
 Then: `docker compose exec postgres psql -U postgres -l`
 Expected: output lists `postgres`, `iceberg_catalog`, and `airflow` as databases.
 
-- [ ] **Step 5: Verify MinIO bucket creation**
+- [ ] **Step 5: Verify LocalStack bucket creation**
 
-Run: `docker compose logs minio-init`
-Expected: output includes a line confirming the `warehouse` bucket exists (either "created" or already-exists, since `--ignore-existing` was used), and `docker compose ps minio-init` shows exit code `0`.
+Run: `docker compose logs localstack-init`
+Expected: output includes a line confirming the `warehouse` bucket exists (either "created" or already-exists, since `--ignore-existing` was used), and `docker compose ps localstack-init` shows exit code `0`.
 
 - [ ] **Step 6: Verify Kafka produce/consume**
 
@@ -237,14 +242,14 @@ Expected: first command exits `0` (`.env` is ignored); second command's count is
 
 - [ ] **Step 9: Verify clean restart (idempotency)**
 
-Run: `docker compose down && docker compose up -d postgres minio minio-init kafka kafka-ui`
+Run: `docker compose down && docker compose up -d postgres localstack localstack-init kafka kafka-ui`
 Expected: all five services reach a running/completed state again with no errors in `docker compose logs`, and repeating Step 4's database check still shows all three databases (Postgres data persisted via the named volume).
 
 - [ ] **Step 10: Commit**
 
 ```bash
 git add docker-compose.yml .env.example .gitignore infra/postgres/init-multiple-dbs.sh
-git commit -m "infra: add Postgres, MinIO, and Kafka (KRaft) to local stack"
+git commit -m "infra: add Postgres, LocalStack, and Kafka (KRaft) to local stack"
 ```
 
 ---
@@ -257,12 +262,12 @@ git commit -m "infra: add Postgres, MinIO, and Kafka (KRaft) to local stack"
 - Create: `infra/spark/smoke_test.py`
 
 **Interfaces:**
-- Consumes: Task 1's `postgres:5432` (databases `iceberg_catalog`), `minio:9000` (bucket `warehouse`), and their credentials.
+- Consumes: Task 1's `postgres:5432` (databases `iceberg_catalog`), `localstack:4566` (bucket `warehouse`), and their credentials.
 - Produces (for later tasks and Task 3):
   - Iceberg REST catalog at `iceberg-rest:8181` (internal) / `localhost:8181`.
   - Spark catalog name `lakehouse` (configured in `spark-defaults.conf`), pointing at the REST catalog and `s3a://warehouse/`.
   - Spark master at `spark-master:7077` (internal), UI at `localhost:8080`; workers' UIs at `localhost:8081` / `localhost:8082`.
-  - A proven table `lakehouse.smoke.ping`, physically present under `s3://warehouse/smoke/ping/` in MinIO — this is what Task 3 reads from ClickHouse.
+  - A proven table `lakehouse.smoke.ping`, physically present under `s3://warehouse/smoke/ping/` in LocalStack — this is what Task 3 reads from ClickHouse.
 
 - [ ] **Step 1: Write `infra/spark/spark-defaults.conf`**
 
@@ -273,9 +278,9 @@ spark.sql.catalog.lakehouse.catalog-impl=org.apache.iceberg.rest.RESTCatalog
 spark.sql.catalog.lakehouse.uri=http://iceberg-rest:8181
 spark.sql.catalog.lakehouse.warehouse=s3a://warehouse/
 spark.sql.catalog.lakehouse.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-spark.sql.catalog.lakehouse.s3.endpoint=http://minio:9000
+spark.sql.catalog.lakehouse.s3.endpoint=http://localstack:4566
 spark.sql.catalog.lakehouse.s3.path-style-access=true
-spark.hadoop.fs.s3a.endpoint=http://minio:9000
+spark.hadoop.fs.s3a.endpoint=http://localstack:4566
 spark.hadoop.fs.s3a.path.style.access=true
 spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
 spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
@@ -313,18 +318,19 @@ spark.stop()
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
+      localstack-init:
         condition: service_completed_successfully
     environment:
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
       CATALOG_JDBC_USER: ${POSTGRES_USER}
       CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ENDPOINT: http://localstack:4566
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
     ports:
       - "8181:8181"
@@ -338,8 +344,9 @@ spark.stop()
     image: bitnami/spark:3.5.3
     environment:
       SPARK_MODE: master
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
     depends_on:
       iceberg-rest:
         condition: service_healthy
@@ -357,8 +364,9 @@ spark.stop()
       SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
     depends_on:
       - spark-master
     volumes:
@@ -373,8 +381,9 @@ spark.stop()
       SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
     depends_on:
       - spark-master
     volumes:
@@ -408,8 +417,8 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
 - Modify: `docker-compose.yml` (add `clickhouse`)
 
 **Interfaces:**
-- Consumes: Task 2's `lakehouse.smoke.ping` table, physically at `s3://warehouse/smoke/ping/` in MinIO (`minio:9000`), and Task 1's MinIO credentials.
-- Produces: ClickHouse reachable at `clickhouse:8123` (internal) / `localhost:8123` (HTTP) and `localhost:9010` (native), proven able to read an Iceberg table directly from MinIO.
+- Consumes: Task 2's `lakehouse.smoke.ping` table, physically at `s3://warehouse/smoke/ping/` in LocalStack (`localstack:4566`), and Task 1's LocalStack credentials.
+- Produces: ClickHouse reachable at `clickhouse:8123` (internal) / `localhost:8123` (HTTP) and `localhost:9010` (native), proven able to read an Iceberg table directly from LocalStack.
 
 - [ ] **Step 1: Add `clickhouse` to `docker-compose.yml`**
 
@@ -417,7 +426,7 @@ git commit -m "infra: add Iceberg REST catalog and Spark cluster, proven with wr
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     depends_on:
-      minio:
+      localstack:
         condition: service_healthy
     ports:
       - "8123:8123"
@@ -444,18 +453,20 @@ Run:
 ```bash
 docker compose exec clickhouse clickhouse-client --query "
   SELECT * FROM icebergS3(
-    'http://minio:9000/warehouse/smoke/ping/',
-    '${MINIO_ROOT_USER}', '${MINIO_ROOT_PASSWORD}'
+    'http://localstack:4566/warehouse/smoke/ping/',
+    'test', 'test'
   )
 "
 ```
+(Credentials are the literal `.env` values from Step 1 of Task 1, inlined here because this command runs in the host shell, which doesn't read `.env` the way `docker compose` does.)
+
 Expected: output is one row, `1\thello-iceberg`. If this exact function call errors on the installed ClickHouse version, check `clickhouse-client --query "SELECT * FROM system.functions WHERE name ILIKE '%iceberg%'"` for the available function/engine name on this version and adjust the call accordingly — this is the version-sensitivity risk flagged in Global Constraints.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add docker-compose.yml
-git commit -m "infra: add ClickHouse, proven to read Iceberg tables natively from MinIO"
+git commit -m "infra: add ClickHouse, proven to read Iceberg tables natively from LocalStack"
 ```
 
 ---
