@@ -14,9 +14,10 @@ laptop, and pushed to a private GitHub repo.
 
 To make the tooling exercise meaningful rather than arbitrary, the project
 is framed around a genuine consumer problem: **GameDeal Intelligence** — a
-platform that tracks real game prices across PC (Steam) and PS5
-(PlatPrices), stores full price history, and answers "is this actually a
-good deal, and should I buy now or wait?"
+platform that tracks real game prices across PC (Steam) and PS5 (direct
+PlayStation Store price scraping — see Data sources), stores full price
+history, and answers "is this actually a good deal, and should I buy now
+or wait?"
 
 ## Goals
 
@@ -25,7 +26,7 @@ good deal, and should I buy now or wait?"
   Airflow, entirely in docker-compose.
 - Track real price/discount data for a curated watchlist of 350 games
   (split across mutual and platform-exclusive tiers — see Scope),
-  comparing PC (Steam) vs PS5 (PlatPrices) pricing.
+  comparing PC (Steam) vs PS5 (PlayStation Store) pricing.
 - Produce a Deal Quality Score (0-100) per **(game, platform, region)**,
   based on that combination's own historical price behavior (historical
   low, typical discount depth, sale frequency) — not just the headline
@@ -59,7 +60,11 @@ good deal, and should I buy now or wait?"
 - No fuzzy-matching automation left unchecked: catalog discovery is
   API-driven (see Scope), but ambiguous matches (sequels, editions,
   remasters) always get a human review pass before entering `dim_game` —
-  nothing is auto-accepted on a low-confidence match.
+  nothing is auto-accepted on a low-confidence match. This matters
+  concretely, not just in principle: live probing during design found
+  IGDB listing the 2005 original *Resident Evil 4* and the 2023 remake
+  under the identical title "Resident Evil 4" — exact-name matching alone
+  cannot disambiguate that case.
 - No cloud deployment of any kind (no AWS, no managed services, no company
   infrastructure). Docker-compose on a laptop only.
 - No BI tool in the MVP. Presentation is direct SQL against ClickHouse;
@@ -76,11 +81,18 @@ good deal, and should I buy now or wait?"
   if it were stable and documented. It isn't; the pipeline must handle
   missing fields, request failures, and format drift without falling
   over.
-- Quietly exceeding the PlatPrices free-tier quota (1,000 requests/month)
-  and getting rate-limited or locked out. The batch endpoint is central to
-  the design specifically to avoid this — if it doesn't work as assumed
-  on the free tier (see Risks below), the request budget must be
-  re-derived before relying on it.
+- Treating the PlayStation Store price scrape (see Data sources) as if it
+  were a stable, documented API. It isn't: it's an unauthenticated HTML
+  page fetch of a schema.org `Product`/`Offer` block Sony could restructure
+  without notice. The collector must fail gracefully (log and skip, not
+  crash the DAG) if the page shape changes, same posture as Steam's
+  unofficial endpoint.
+- Trusting IGDB's `platforms` field as the sole signal for PS5
+  availability. Live probing found *Red Dead Redemption 2* missing
+  `PlayStation 5` from its `platforms` list despite having a live, working
+  PS Store listing (it's sold via PS4 backward compatibility, not a native
+  PS5 SKU) — the pipeline must treat "a working PS Store URL resolves" as
+  the real availability signal, not the platform tag alone.
 - A pipeline that uses Kafka/Spark/Iceberg/Airflow as decoration rather
   than for what they're actually good at — e.g. Bronze landing as a
   trivial append-only dump with no real Silver change-detection logic, or
@@ -93,25 +105,56 @@ good deal, and should I buy now or wait?"
 - Must use: Kafka, Spark, Iceberg (on Parquet), a self-hosted columnar
   warehouse (ClickHouse), and Airflow (decided explicitly, built in from
   the start rather than added later).
-- PlatPrices free tier: 1,000 requests/month, 120 req/min burst, 2
-  regions, no price-history endpoint (not needed — the pipeline builds
-  its own history via repeated observation).
+- PlatPrices is **not used** — confirmed as of 2026-11-05 to require a
+  paid purchase (no free-tier key available), contrary to the original
+  plan. PS5 pricing instead comes from a direct, unauthenticated
+  PlayStation Store page fetch (see Data sources) — no quota, no key,
+  no cost, but no stability guarantee either (see Anti-goals/Risks).
 - Steam's pricing endpoint (`store.steampowered.com/api/appdetails`) is
   unofficial and undocumented. No official rate limit, but no stability
   guarantee either — must be polled defensively.
-- RAWG free tier (~20k requests/month) is not a binding constraint given
-  how rarely game metadata changes.
+- IGDB (via Twitch developer OAuth, free, no payment) replaces RAWG for
+  discovery/metadata as of 2026-11-05 — RAWG suffered an extended outage
+  (Cloudflare 522, origin unreachable across multiple checks spanning
+  more than a day) during this project's build. IGDB's free tier
+  (~4 req/sec, 8 concurrent, no published monthly cap) is not a binding
+  constraint for a 350-game watchlist.
 
 ## Data sources
 
 | Source | Role | Auth | Budget constraint |
 |---|---|---|---|
 | Steam `appdetails` (`price_overview`) | PC price facts: currency, initial/final price, discount % | None (keyless, unofficial) | None official — self-imposed politeness only |
-| PlatPrices `/games/batch` | PS5 price facts: current price, discount %, historical low, PS Plus price (standard edition only) | API key | 1,000 req/month free tier — **must use batching** (see below) |
-| RAWG | Dimension/metadata: genre, publisher, developer, release date, platforms, ratings | API key | ~20k req/month free tier — not binding |
+| PlayStation Store page fetch (`store.playstation.com/<locale>/{concept,product}/<id>`) | PS5 price facts: current price, discount %, pre-order vs. live status (standard edition only) | None (keyless, unauthenticated) | None official — self-imposed politeness only. Not PlatPrices: PlatPrices was confirmed paid-only on 2026-11-05 and is not used anywhere in this design. |
+| IGDB (`api.igdb.com`, via Twitch OAuth) | Dimension/metadata: platforms, release date, publisher; **primary** discovery/matching source — `websites` field gives direct Steam and PS Store URLs per game, not just a name to fuzzy-match | Free Twitch developer app (`client_id`/`client_secret`, OAuth2 client-credentials) | ~4 req/sec, 8 concurrent — not binding for 350 games |
+| Steam `storesearch` (unofficial) | **Fallback** matching: resolves a game to its Steam listing when IGDB's `websites` field omits the Steam URL (confirmed happens — e.g. *Marvel's Spider-Man Remastered*) | None (keyless, unofficial) | None official — self-imposed politeness only |
 | IsThereAnyDeal (ITAD) | One-time/periodic **backfill**: historical low + price history for the PC/Steam side only, used to seed Silver/Gold with real history on day one instead of waiting weeks | Free API key | Batches up to 50 games/call; exact rate limits unconfirmed — verify live before relying on it (see Risks) |
 
-Note: ITAD backfill covers the **PC side only**. There is no free historical-price source for PS5 (PlatPrices' price-history endpoint is paid-only), so per the project owner's decision, PS5 history builds up organically through live collection — expect it to take roughly a month before the Deal Quality Score on that side is meaningful.
+Note: ITAD backfill covers the **PC side only**. There is no free
+historical-price source for PS5 — the PlayStation Store page fetch only
+ever returns the *current* price, same as PlatPrices' price-history
+endpoint would have been paid-only anyway — so per the project owner's
+decision, PS5 history builds up organically through live collection;
+expect it to take roughly a month before the Deal Quality Score on that
+side is meaningful.
+
+**On matching reliability (found via live probing during design, 12 test
+titles across both console-exclusive and multi-edition franchises):**
+IGDB correctly excludes non-mutual titles (e.g. *Gears of War* — no PS5 in
+`platforms`, correctly bucketed away from `BOTH`) and resolves direct
+storefront URLs for most clean single-edition games (*God of War
+Ragnarök*, *Elden Ring*, *Cyberpunk 2077*, *Hogwarts Legacy*, *Baldur's
+Gate III*, *Mortal Kombat 1*, *Diablo IV*, *Horizon Forbidden West*).
+IGDB is the **primary** source for discovery and matching, not a
+drop-in oracle — three concrete failure modes to design around:
+1. **Sequel/remake name collisions** (see Anti-goals) — needs the
+   existing human-review gate, not just exact-name matching.
+2. **`platforms` misses backward-compatible availability** (see
+   Anti-goals) — use PS Store URL resolution as the real signal.
+3. **Incomplete `websites` data** — IGDB is community-sourced and
+   sometimes omits a storefront link that genuinely exists (confirmed:
+   *Marvel's Spider-Man Remastered* had a PS Store URL but no Steam URL).
+   Steam's own `storesearch` is kept as a fallback for exactly this case.
 
 ## Scope
 
@@ -132,16 +175,20 @@ Note: ITAD backfill covers the **PC side only**. There is no free historical-pri
     item-level cross-platform comparison the way `BOTH` games can.
 
 - **Discovery process** (build-time, produces the `dim_game` seed data):
-  run three separate queries against RAWG's platform filter — games
-  tagged PC **and** PS5 (candidates for `BOTH`), PC **not** PS5
-  (candidates for `STEAM_ONLY`), PS5 **not** PC (candidates for
-  `PS5_ONLY`) — then confirm each candidate's current listing via
-  Steam's and/or PlatPrices' own search endpoints. Clean, unambiguous
-  title matches are auto-accepted; anything ambiguous (sequels, "Complete
-  Edition" vs. base game, remasters) goes through a manual review pass
-  before being added. The output is still a version-controlled seed file
-  in the repo (CSV/YAML) — generated rather than hand-typed, but just as
-  editable/correctable afterward.
+  query IGDB by platform to classify each candidate's coverage tier — PC
+  **and** PS5 (candidates for `BOTH`), PC **not** PS5 (`STEAM_ONLY`), PS5
+  **not** PC (`PS5_ONLY`) — treating a resolvable PS Store URL in IGDB's
+  `websites` field as confirmation of real PS5 availability (not the
+  `platforms` tag alone — see Anti-goals). IGDB's `websites` field
+  supplies the Steam URL directly for most titles; when it's missing,
+  fall back to Steam's `storesearch` to resolve it. Clean, unambiguous
+  title matches (exact name match against IGDB's result, one unambiguous
+  storefront URL per platform) are auto-accepted; anything ambiguous
+  (sequels/remakes sharing an identical title, "Complete Edition" vs.
+  base game, multiple IGDB entries with no clear canonical pick) goes
+  through a manual review pass before being added. The output is still a
+  version-controlled seed file in the repo (CSV/YAML) — generated rather
+  than hand-typed, but just as editable/correctable afterward.
 
 - **Identity resolution / `dim_game`**: loaded from the seed file into
   Iceberg by a batch job. Schema:
@@ -152,33 +199,39 @@ Note: ITAD backfill covers the **PC side only**. There is no free historical-pri
     canonical_name    STRING,
     coverage          STRING,   -- "BOTH" | "STEAM_ONLY" | "PS5_ONLY"
     steam_appid       INT,      -- null if coverage = "PS5_ONLY"
-    platprices_ppid   STRING,   -- null if coverage = "STEAM_ONLY"; PS5, standard edition
-    rawg_id           INT,
+    ps_store_path     STRING,   -- null if coverage = "STEAM_ONLY"; the
+                                 -- trailing URL segment after locale, e.g.
+                                 -- "concept/10000333" or
+                                 -- "product/EP1004-...-STANDARD001"; the
+                                 -- collector builds the fetch URL as
+                                 -- store.playstation.com/<locale>/<this>
+    igdb_id           INT,
     added_date        DATE
   )
   ```
 
   `coverage` drives which collector(s) poll a given game (a
-  `STEAM_ONLY` row is never sent to the PlatPrices collector, and vice
+  `STEAM_ONLY` row is never sent to the PS Store collector, and vice
   versa), and it's the join key for every cross-platform comparison in
-  Silver/Gold — Steam facts arrive keyed by `steam_appid`, PlatPrices
-  facts by `ppid`; `dim_game` is what makes `BOTH`-coverage games
+  Silver/Gold — Steam facts arrive keyed by `steam_appid`, PS Store facts
+  by `ps_store_path`; `dim_game` is what makes `BOTH`-coverage games
   comparable, while `STEAM_ONLY`/`PS5_ONLY` games feed the platform-level
   aggregates instead.
 
 ## Regions and currency
 
-Both Steam and PlatPrices are queried in **two fixed regions**: Israel
-(the project owner's home region, `IL`) and the United States (`US`).
-Steam supports this via its `cc` query parameter directly; PlatPrices
-supports it via its `region` parameter, within its free-tier limit of 2
-regions — matching exactly. (Whether PlatPrices' region list uses the
-code `IL` needs a live check against its `/regions` endpoint — see
-Risks.) Each collector only queries the regions for games actually in
-its scope per `dim_game.coverage` (see Scope) — e.g. a `STEAM_ONLY` game
-never generates a PlatPrices call in either region.
+Both Steam and the PlayStation Store are queried in **two fixed regions**:
+Israel (the project owner's home region, `IL`) and the United States
+(`US`). Steam supports this via its `cc` query parameter directly; the
+PlayStation Store supports it via the locale segment in the page path —
+confirmed live during design: `store.playstation.com/en-us/concept/<id>`
+returns USD pricing, `store.playstation.com/en-il/concept/<id>` returns
+ILS pricing, same concept ID, same product, no separate region parameter
+or lookup needed. Each collector only queries the regions for games
+actually in its scope per `dim_game.coverage` (see Scope) — e.g. a
+`STEAM_ONLY` game never generates a PS Store fetch in either region.
 
-Every fact row (Steam and PlatPrices) is stored with its **region** and
+Every fact row (Steam and PS Store) is stored with its **region** and
 **native currency** as collected, for fidelity. For comparison purposes
 (the "where's it cheaper" and Deal Quality Score questions), Gold
 converts everything to **USD**, using a small reference table:
@@ -211,8 +264,8 @@ watchlist breadth than on freshness.
 | Source | Games polled | Cadence | Why |
 |---|---|---|---|
 | Steam | `BOTH` + `STEAM_ONLY` = `M + y` games, per region (IL + US) | Daily | Not budget-constrained, but no real-world benefit to polling more often than discounts actually change. |
-| PlatPrices | `BOTH` + `PS5_ONLY` = `M + y` games, per region (IL + US), via `/games/batch` | Daily | Budget-constrained: one quota unit per batch call regardless of records returned, 25 records/page on the free tier. Monthly cost: `ceil((M+y)/25) × 2 regions × 30 days`. Since `M + y = (M + 350) / 2` (see Scope) and `M` ranges from 0 to 350, this is bounded above by its worst case at `M = 350` (all mutual, no exclusives): `ceil(350/25) × 2 × 30 = 840/month`. So the full range of possible outcomes from the discovery process — however many mutual titles it actually finds — stays comfortably inside the 1,000/month free tier. |
-| RAWG | All 350 games | Weekly | Metadata for already-released games is effectively static; weekly is generous freshness margin at negligible API cost (~20k/month budget, not binding). |
+| PlayStation Store page fetch | `BOTH` + `PS5_ONLY` = `M + y` games, per region (IL + US), one page fetch per game per region | Daily | No metered quota (unauthenticated page fetch, not a billed API) — unlike PlatPrices, there's no request budget to derive or stay under. Self-imposed politeness (request spacing) applies instead, same posture as the Steam collector. |
+| IGDB | All 350 games | Weekly | Metadata for already-released games is effectively static; weekly is generous freshness margin at negligible API cost (~4 req/sec budget, not binding). |
 | ITAD (backfill) | `BOTH` + `STEAM_ONLY` = `M + y` games (PC side only) | One-time initial load, re-synced periodically (e.g. monthly) | It's historical data by nature — no need for frequent polling once the initial backfill lands. |
 
 Note: both collectors end up polling the same number of games (`M + y`)
@@ -222,13 +275,13 @@ just poll different, overlapping-at-`BOTH` subsets of the 350-game list.
 ## Architecture
 
 ```
-Airflow DAGs                  Kafka                 Spark                          Iceberg (on LocalStack S3) ClickHouse
+Airflow DAGs                  Kafka                 Spark                          Iceberg (on SeaweedFS S3) ClickHouse
 ┌──────────────────┐   ┌──────────────────┐  ┌──────────────────────┐      ┌─────────────────────┐    ┌──────────────┐
 │ steam_collector   │──▶│raw.steam.prices  │─▶│                      │Bronze▶│ bronze.* (append)    │    │              │
 │ (daily, batched)  │   ├──────────────────┤  │ Bronze: continuous    │      ├─────────────────────┤    │              │
-│ platprices_coll.  │──▶│raw.platprices    │─▶│ Structured Streaming  │      │ dim_game (seed load)  │    │              │
-│ (daily, batched)  │   ├──────────────────┤  │ (long-running service,│Silver▶│ silver.* (MERGE,      │sync▶│  ClickHouse  │
-│ rawg_collector    │──▶│raw.rawg.metadata │─▶│ outside Airflow)       │      │  change events)       │    │  (MergeTree) │
+│ ps_store_coll.    │──▶│raw.ps_store      │─▶│ Structured Streaming  │      │ dim_game (seed load)  │    │              │
+│ (daily, page fetch│   ├──────────────────┤  │ (long-running service,│Silver▶│ silver.* (MERGE,      │sync▶│  ClickHouse  │
+│ igdb_collector    │──▶│raw.igdb.metadata │─▶│ outside Airflow)       │      │  change events)       │    │  (MergeTree) │
 │ (weekly)          │   └──────────────────┘  │                      │Gold──▶│ gold.* (deal score,   │    │              │
 └──────────────────┘                          │ Silver/Gold/sync:     │      │  history, comparisons) │    │              │
 ┌──────────────────┐                          │ batch jobs, Airflow-  │      └─────────────────────┘    └──────────────┘
@@ -239,7 +292,7 @@ Airflow DAGs                  Kafka                 Spark                       
 ```
 
 **Kafka** — Apache Kafka in KRaft mode (no Zookeeper), single broker.
-Topics `raw.steam.prices`, `raw.platprices.prices`, `raw.rawg.metadata`,
+Topics `raw.steam.prices`, `raw.ps_store.prices`, `raw.igdb.metadata`,
 keyed by `game_key`, 1-3 partitions each, short retention (3-7 days —
 Kafka is a replay buffer, not permanent storage; Iceberg is permanent
 storage). Kafka UI included for topic/message/consumer-lag visibility
@@ -260,20 +313,22 @@ cores / ~2GB RAM per worker). Two distinct job types:
 
 Spark UI exposed (8080 master, 4040 per-application) for observability.
 
-**Iceberg** — table format on Parquet files stored in LocalStack's S3
+**Iceberg** — table format on Parquet files stored in SeaweedFS's S3
 emulation (local S3-compatible object storage; chosen over MinIO, whose
 free Docker images were pulled from Docker Hub and whose open-source
-distribution was discontinued in 2026 — see the infra-foundation plan's
-ledger for the full story). Catalog: Iceberg REST catalog backed by
+distribution was discontinued in 2026, and over LocalStack, whose
+Community edition cannot persist data across container restarts — see
+the infra-foundation plan's ledger for the full story on both swaps).
+Catalog: Iceberg REST catalog backed by
 Postgres (the same Postgres instance also backs Airflow's metadata DB,
 in separate schemas, to limit the number of containers on a laptop).
 Bronze/Silver/Gold layering, plus the `dim_game` dimension table.
 
 **ClickHouse** — the serving warehouse. Gold Iceberg tables are synced
 into native ClickHouse `MergeTree` tables via ClickHouse's built-in
-Iceberg table function reading directly from LocalStack's S3 emulation
+Iceberg table function reading directly from SeaweedFS's S3 emulation
 (`INSERT INTO ...
-SELECT * FROM icebergS3(...)`), run as the final task in the batch DAG.
+SELECT * FROM iceberg(...)`), run as the final task in the batch DAG.
 Chosen over Snowflake/OpenSearch-style simulation as the most realistic
 "runs great in one container on a laptop" option.
 
@@ -294,14 +349,14 @@ chain (Silver → Gold → ClickHouse sync) is a genuine dependency chain
 that benefits from real retries, failure alerting, and backfill support,
 and because it's a commonly paired skill with Kafka/Spark in practice.
 Webserver + scheduler + shared Postgres metadata DB. DAGs:
-- Three collector DAGs (`steam_collector`, `platprices_collector`,
-  `rawg_collector`), one per source, each on its own schedule, each
-  looping over both regions (IL, US).
+- Three collector DAGs (`steam_collector`, `ps_store_collector`,
+  `igdb_collector`), one per source, each on its own schedule, each
+  looping over both regions (IL, US) where applicable.
 - One `itad_backfill` DAG — runs once on initial setup, then re-syncs
   periodically (e.g. monthly) to keep PC-side historical data current.
 - One `dim_game` load DAG (loads the seed file into Iceberg; run
   on-demand or whenever the seed file changes).
-- One `fx_rates` load DAG — weekly, same cadence as RAWG.
+- One `fx_rates` load DAG — weekly, same cadence as IGDB.
 - One batch-chain DAG (`silver_gold_sync`) with Silver → Gold → ClickHouse
   sync as dependent tasks, scheduled daily. Gold applies the `fx_rates`
   table to normalize all prices to USD before computing the Deal Quality
@@ -312,34 +367,39 @@ scope; Metabase/Superset is a plausible future add-on.
 
 ## Risks / things to validate early, before relying on them architecturally
 
-1. **PlatPrices `/games/batch` on the free tier.** The published docs
-   don't explicitly gate this endpoint behind a paid plan (unlike
-   price-history, which is explicitly paid-only), but this hasn't been
-   confirmed with a live call. If batching isn't available on the free
-   tier, or the per-page limit differs from 25, the request budget and
-   possibly the 100-game target need to be recalculated. **Do this check
-   first**, before building the PlatPrices collector.
-2. **PlatPrices region codes for `IL` and `US`.** Needs a live check
-   against PlatPrices' `/regions` endpoint before the collector is built
-   — Israel is confirmed to be a real PlayStation Store region, but
-   whether PlatPrices uses the code `IL` (vs. some other code) for it is
-   unconfirmed.
-3. **ITAD's actual free-tier rate limits and exact endpoint paths**
+1. **PlayStation Store page structure could change without notice.**
+   Confirmed working during design (both `en-us` and `en-il` locales,
+   both a `/concept/<id>` and a `/product/<sku>` path style, including a
+   real pre-order listing — *GTA VI* at ₪319.00), via a clean embedded
+   `application/ld+json` `Product`/`Offer` block plus a richer inline
+   data block for discount/edition/platform fields. But it's an
+   unauthenticated scrape of Sony's own storefront, not a documented API
+   — no stability guarantee. The collector must fail gracefully (log and
+   skip, not crash the DAG) if the page shape changes, same posture as
+   Steam's unofficial endpoint.
+2. **IGDB's `websites` field completeness is not guaranteed.** Confirmed
+   gap during design: *Marvel's Spider-Man Remastered* had a PS Store URL
+   but no Steam URL in IGDB's data, despite definitely having a Steam
+   listing. Steam's own `storesearch` fallback (see Data sources) exists
+   specifically to cover this; relying on IGDB alone for Steam-side
+   matching will silently under-match some titles.
+3. **Sequel/remake title collisions in IGDB.** Confirmed during design:
+   the 2005 original *Resident Evil 4* and the 2023 remake share the
+   identical IGDB title "Resident Evil 4." Exact-name matching cannot
+   disambiguate this on its own — the human review gate (see Scope) must
+   catch it, and the discovery process should flag same-title multi-match
+   cases for review rather than silently picking the first/highest result.
+4. **ITAD's actual free-tier rate limits and exact endpoint paths**
    weren't confirmed from official docs — check github.com/isthereanydeal/api
    before building the backfill job.
-4. **RAWG → Steam appid linkage.** The design assumes RAWG's `stores`
-   field can be parsed to find a game's Steam listing (useful for
-   cross-checking the hand-curated mapping), but this hasn't been
-   confirmed live. Not load-bearing — the mapping table is hand-curated
-   regardless — but worth a quick check.
-5. **Steam's unofficial endpoint** could change or disappear without
-   notice. The collector should fail gracefully (log and skip, not crash
-   the DAG) if its shape changes.
+5. **Steam's unofficial endpoints** (both `appdetails` and `storesearch`)
+   could change or disappear without notice. Collectors should fail
+   gracefully (log and skip, not crash the DAG) if their shape changes.
 
 ## What's left to the builder
 
-- Running the three-tier discovery process against RAWG/Steam/PlatPrices
-  to actually populate `dim_game` (20 `BOTH`-tier titles are already
+- Running the three-tier discovery process against IGDB/Steam/PlayStation
+  Store to actually populate `dim_game` (20 `BOTH`-tier titles are already
   selected from brainstorming and seed that tier; the rest, and the
   `STEAM_ONLY`/`PS5_ONLY` tiers, come from the discovery process defined
   in Scope, including the manual-review pass for ambiguous matches).
