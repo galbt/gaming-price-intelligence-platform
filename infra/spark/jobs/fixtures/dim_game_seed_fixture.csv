@@ -1,0 +1,5 @@
+game_key,canonical_name,coverage,steam_appid,ps_store_path,igdb_id,added_date
+elden_ring,Elden Ring,BOTH,1245620,concept/10000333,119133,2026-11-05
+hollow_knight,Hollow Knight,STEAM_ONLY,367520,,999,2026-11-05
+a_ps5_exclusive,A PS5 Exclusive,PS5_ONLY,,concept/999999,888,2026-11-05
+gta_trilogy_definitive,"Grand Theft Auto: The Trilogy - The ""Definitive"" Edition",BOTH,1234567,concept/1234567,777,2026-11-05

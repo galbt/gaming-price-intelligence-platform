@@ -151,7 +151,7 @@ services:
     ports:
       - "7077:7077"
       - "8080:8080"
-    mem_limit: 1g
+    mem_limit: 2g
     restart: on-failure
 
   spark-worker-1:
@@ -168,6 +168,7 @@ services:
       - spark-master
     volumes:
       - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./infra/spark:/opt/spark-apps
     ports:
       - "8081:8081"
     mem_limit: 2500m
@@ -187,6 +188,7 @@ services:
       - spark-master
     volumes:
       - ./infra/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./infra/spark:/opt/spark-apps
     ports:
       - "8082:8081"
     mem_limit: 2500m
