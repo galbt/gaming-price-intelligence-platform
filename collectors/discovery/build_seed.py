@@ -37,7 +37,7 @@ def classify_coverage(has_pc: bool, has_ps5: bool) -> str:
     return "OTHER"
 
 
-def build_candidates(pc_games: list[dict], ps5_games: list[dict]) -> list[dict]:
+def build_candidates(pc_games: list[dict], ps5_games: list[dict], pc_id: int, ps5_id: int) -> list[dict]:
     pc_ids = {g["id"] for g in pc_games}
     ps5_ids = {g["id"] for g in ps5_games}
 
@@ -47,8 +47,14 @@ def build_candidates(pc_games: list[dict], ps5_games: list[dict]) -> list[dict]:
 
     candidates = []
     for game_id, game in by_id.items():
-        has_pc = game_id in pc_ids
-        has_ps5 = game_id in ps5_ids or extract_ps_store_path(game["websites"]) is not None
+        # The platform-filtered queries are paginated and capped (max_pages),
+        # with no stable sort, so query-result membership alone can miss a real
+        # game that fell outside the fetched page window. Each game's own
+        # `platforms` field (and, for PS5, a resolvable Store URL) is trusted
+        # as an independent, overriding signal rather than relying solely on
+        # which query happened to surface it.
+        has_pc = game_id in pc_ids or pc_id in game["platforms"] or extract_steam_appid(game["websites"]) is not None
+        has_ps5 = game_id in ps5_ids or ps5_id in game["platforms"] or extract_ps_store_path(game["websites"]) is not None
         coverage = classify_coverage(has_pc, has_ps5)
         if coverage == "OTHER":
             continue

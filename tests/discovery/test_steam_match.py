@@ -60,3 +60,13 @@ def test_best_match_none_when_no_results():
     match, confident = best_match("Some Game", [])
     assert match is None
     assert confident is False
+
+
+def test_best_match_low_confidence_on_remaster_vs_original():
+    # Regression test: stripping "remastered" would make a remaster normalize
+    # to the same name as the original game, which is usually a different
+    # Steam listing (different appid, different store page).
+    results = [{"id": 1, "name": "Elden Ring"}]
+    match, confident = best_match("Elden Ring: Remastered", results)
+    assert match == {"id": 1, "name": "Elden Ring"}
+    assert confident is False

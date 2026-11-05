@@ -1,8 +1,12 @@
 import requests
 
 EDITION_SUFFIXES = [
-    ": deluxe edition", ": complete edition", ": remastered",
-    ": director's cut", ": game of the year edition",
+    # Only cosmetic suffixes that don't change which underlying product the
+    # name refers to. "remastered", "director's cut", and "game of the year
+    # edition" are deliberately excluded: those usually denote a distinct
+    # storefront listing (different appid) from the original release, so
+    # stripping them would make a remaster match its original as "confident".
+    ": deluxe edition", ": complete edition",
 ]
 
 

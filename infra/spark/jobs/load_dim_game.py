@@ -25,7 +25,13 @@ def main(seed_path: str) -> None:
         ) USING iceberg
     """)
 
-    df = spark.read.csv(seed_path, header=True, schema=SCHEMA)
+    # escape='"' matches Python's csv module, which escapes an embedded quote
+    # by doubling it ("") rather than Spark's default backslash escape — without
+    # this, a quoted title (e.g. containing a comma or an embedded quote) loads
+    # with its quoting corrupted into the stored value. mode="FAILFAST" surfaces
+    # a malformed row (bad int, bad date, empty/duplicate key) as an error
+    # instead of silently writing NULL for it.
+    df = spark.read.csv(seed_path, header=True, schema=SCHEMA, escape='"', mode="FAILFAST")
     df = df.withColumn("added_date", df["added_date"].cast("date"))
     df.createOrReplaceTempView("seed_source")
     spark.sql("INSERT OVERWRITE lakehouse.dim.dim_game SELECT * FROM seed_source")

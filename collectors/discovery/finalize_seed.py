@@ -6,7 +6,18 @@ SEED_FIELDNAMES = ["game_key", "canonical_name", "coverage", "steam_appid", "ps_
 
 
 def merge_reviewed(matched: list[dict], needs_review: list[dict], review_decisions: dict[int, dict | None]) -> list[dict]:
-    result = [dict(entry) for entry in matched]
+    result = []
+    for entry in matched:
+        igdb_id = entry["igdb_id"]
+        if igdb_id in review_decisions:
+            decision = review_decisions[igdb_id]
+            if decision is None:
+                continue
+            updated = dict(entry)
+            updated.update(decision)
+            result.append(updated)
+        else:
+            result.append(dict(entry))
     for entry in needs_review:
         decision = review_decisions.get(entry["igdb_id"])
         if decision is None:
@@ -19,14 +30,28 @@ def merge_reviewed(matched: list[dict], needs_review: list[dict], review_decisio
 
 def to_dim_game_rows(merged: list[dict], added_date: str) -> list[dict]:
     rows = []
+    seen_keys: dict[str, int] = {}
     for entry in merged:
+        key = game_key_for(entry["canonical_name"])
+        if not key:
+            raise ValueError(
+                f"empty game_key for igdb_id={entry['igdb_id']} (canonical_name={entry['canonical_name']!r})"
+            )
+        if key in seen_keys and seen_keys[key] != entry["igdb_id"]:
+            raise ValueError(
+                f"duplicate game_key {key!r} for igdb_id={entry['igdb_id']} and igdb_id={seen_keys[key]} "
+                "— a human reviewer must disambiguate (e.g. correct canonical_name) before this can be loaded"
+            )
+        seen_keys[key] = entry["igdb_id"]
+
+        coverage = entry["coverage"]
         rows.append(
             {
-                "game_key": game_key_for(entry["canonical_name"]),
+                "game_key": key,
                 "canonical_name": entry["canonical_name"],
-                "coverage": entry["coverage"],
-                "steam_appid": entry["steam_appid"],
-                "ps_store_path": entry["ps_store_path"],
+                "coverage": coverage,
+                "steam_appid": entry["steam_appid"] if coverage in ("BOTH", "STEAM_ONLY") else None,
+                "ps_store_path": entry["ps_store_path"] if coverage in ("BOTH", "PS5_ONLY") else None,
                 "igdb_id": entry["igdb_id"],
                 "added_date": added_date,
             }

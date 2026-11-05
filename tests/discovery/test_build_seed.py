@@ -63,7 +63,7 @@ def test_build_candidates_classifies_and_discards_other():
         {"id": 4, "name": "A PS5 Exclusive", "platforms": [167], "websites": []},
     ]
 
-    result = build_candidates(pc_games, ps5_games)
+    result = build_candidates(pc_games, ps5_games, pc_id=6, ps5_id=167)
 
     assert result == [
         {"igdb_id": 1, "canonical_name": "Elden Ring", "coverage": "BOTH", "websites": ["https://store.steampowered.com/app/1245620"]},
@@ -80,7 +80,7 @@ def test_build_candidates_counts_ps_url_as_ps5_even_when_platforms_field_misses_
     ]
     ps5_games = []  # does NOT appear in the PS5-platform query
 
-    result = build_candidates(pc_games, ps5_games)
+    result = build_candidates(pc_games, ps5_games, pc_id=6, ps5_id=167)
 
     assert result == [
         {
@@ -89,6 +89,23 @@ def test_build_candidates_counts_ps_url_as_ps5_even_when_platforms_field_misses_
             "coverage": "BOTH",
             "websites": ["https://store.playstation.com/en-us/concept/209441"],
         },
+    ]
+
+
+def test_build_candidates_trusts_own_platforms_field_when_missing_from_query_page():
+    # Regression test: IGDB's platform-filtered queries are paginated and capped
+    # (max_pages), with no stable sort, so a real game can fall outside the
+    # fetched page window and never appear in one query's result list at all.
+    # Its own `platforms` field must still be trusted, not just query membership.
+    pc_games = []  # never appeared in the (capped, unsorted) PC-platform query
+    ps5_games = [
+        {"id": 5, "name": "Paginated Mutual Game", "platforms": [6, 167], "websites": []},
+    ]
+
+    result = build_candidates(pc_games, ps5_games, pc_id=6, ps5_id=167)
+
+    assert result == [
+        {"igdb_id": 5, "canonical_name": "Paginated Mutual Game", "coverage": "BOTH", "websites": []},
     ]
 
 
