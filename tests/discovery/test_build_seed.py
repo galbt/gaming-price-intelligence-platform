@@ -1,8 +1,9 @@
 from collectors.discovery.build_seed import (
     game_key_for, extract_steam_appid, extract_ps_store_path, classify_coverage, build_candidates,
-    find_game_key_collisions, write_candidates_csv,
+    find_game_key_collisions, write_candidates_csv, attach_identifiers, match_candidates,
 )
 import csv
+from unittest.mock import patch
 
 
 def test_game_key_for_slugifies_name():
@@ -120,3 +121,73 @@ def test_write_candidates_csv_round_trips_commas_in_titles(tmp_path):
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
     assert rows == [{"igdb_id": "1", "canonical_name": "Tom Clancy's, The Division", "coverage": "BOTH"}]
+
+
+def test_attach_identifiers_resolves_from_websites_and_nulls_inapplicable_fields():
+    candidates = [
+        {"igdb_id": 1, "canonical_name": "Elden Ring", "coverage": "BOTH",
+         "websites": ["https://store.steampowered.com/app/1245620", "https://store.playstation.com/en-us/concept/10000333"]},
+        {"igdb_id": 2, "canonical_name": "A PS5 Exclusive", "coverage": "PS5_ONLY", "websites": []},
+    ]
+
+    result = attach_identifiers(candidates)
+
+    assert result == [
+        {"igdb_id": 1, "canonical_name": "Elden Ring", "coverage": "BOTH", "steam_appid": 1245620, "ps_store_path": "concept/10000333"},
+        {"igdb_id": 2, "canonical_name": "A PS5 Exclusive", "coverage": "PS5_ONLY", "steam_appid": None, "ps_store_path": None},
+    ]
+
+
+def test_match_candidates_passes_through_fully_resolved_without_steam_call():
+    candidates = [
+        {"igdb_id": 1, "canonical_name": "Elden Ring", "coverage": "BOTH", "steam_appid": 1245620, "ps_store_path": "concept/10000333"},
+    ]
+
+    with patch("collectors.discovery.build_seed.search_steam") as mock_search:
+        matched, needs_review = match_candidates(candidates)
+
+    mock_search.assert_not_called()
+    assert matched == candidates
+    assert needs_review == []
+
+
+def test_match_candidates_falls_back_to_steam_search_when_appid_missing():
+    candidates = [
+        {"igdb_id": 2, "canonical_name": "Marvel's Spider-Man Remastered", "coverage": "BOTH", "steam_appid": None, "ps_store_path": "concept/10000762"},
+    ]
+
+    with patch("collectors.discovery.build_seed.search_steam", return_value=[{"id": 1817070, "name": "Marvel's Spider-Man Remastered"}]):
+        matched, needs_review = match_candidates(candidates)
+
+    assert matched == [
+        {"igdb_id": 2, "canonical_name": "Marvel's Spider-Man Remastered", "coverage": "BOTH", "steam_appid": 1817070, "ps_store_path": "concept/10000762"},
+    ]
+    assert needs_review == []
+
+
+def test_match_candidates_sends_unresolved_ps_store_path_to_review():
+    candidates = [
+        {"igdb_id": 3, "canonical_name": "A PS5 Exclusive", "coverage": "PS5_ONLY", "steam_appid": None, "ps_store_path": None},
+    ]
+
+    matched, needs_review = match_candidates(candidates)
+
+    assert matched == []
+    assert needs_review == [
+        {"igdb_id": 3, "canonical_name": "A PS5 Exclusive", "coverage": "PS5_ONLY", "steam_appid": None, "ps_store_path": None, "steam_candidates": []},
+    ]
+
+
+def test_match_candidates_sends_low_confidence_steam_fallback_to_review():
+    candidates = [
+        {"igdb_id": 4, "canonical_name": "Dark Souls III", "coverage": "STEAM_ONLY", "steam_appid": None, "ps_store_path": None},
+    ]
+
+    with patch("collectors.discovery.build_seed.search_steam", return_value=[{"id": 999, "name": "Dark Souls"}]):
+        matched, needs_review = match_candidates(candidates)
+
+    assert matched == []
+    assert needs_review == [
+        {"igdb_id": 4, "canonical_name": "Dark Souls III", "coverage": "STEAM_ONLY", "steam_appid": None, "ps_store_path": None,
+         "steam_candidates": [{"id": 999, "name": "Dark Souls"}]},
+    ]
